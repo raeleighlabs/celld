@@ -38,6 +38,19 @@ const MAX_REMOTE_PENDING_ABORTS: usize = 65_536;
 pub const MAX_REMOTE_COMPLETIONS: usize = 65_536;
 const MAX_ALARM_COMPLETIONS: usize = 65_536;
 
+/// A stop has not yet retired its realm and exact container responsibility.
+/// The eviction deadline cannot turn this into a same-epoch runtime restart.
+#[derive(Debug)]
+pub(crate) struct RuntimeRetirementPending;
+
+impl std::fmt::Display for RuntimeRetirementPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("runtime retirement is still pending")
+    }
+}
+
+impl std::error::Error for RuntimeRetirementPending {}
+
 /// How often the isolate pool gives back what it no longer needs.
 const REAP_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -512,6 +525,7 @@ impl StatelessVerb {
 
 struct CellHandle {
     epoch: u64,
+    container: Option<crate::container::ContainerActivation>,
     /// The application generation whose isolate holds this cell, reported
     /// when the cell leaves for a swap.
     generation: GenerationId,
@@ -610,9 +624,236 @@ fn alarm_reporter(cells: &Arc<Mutex<CellRegistry>>, observe: &AlarmObserver) -> 
 }
 
 #[derive(Default)]
-struct CellRegistry {
+pub(crate) struct CellRegistry {
+    pending: BTreeSet<String>,
     starting: HashMap<String, CellHandle>,
     published: HashMap<String, CellHandle>,
+}
+
+impl CellRegistry {
+    pub(crate) async fn retire(
+        cells: &Arc<Mutex<Self>>,
+        engine: Option<Arc<crate::container::ContainerEngine>>,
+        cell: &str,
+        epoch: u64,
+        mode: &StopMode,
+    ) -> anyhow::Result<()> {
+        let release = cells
+            .lock()
+            .expect("cell registry poisoned")
+            .prepare_container_stop(engine, cell, epoch, mode)
+            .context(RuntimeRetirementPending)?;
+        release.await.context(RuntimeRetirementPending)?;
+        // Only the settled retirement can free the reservation. On failure the
+        // actor keeps retrying this same stop, including after its deadline.
+        let removed = {
+            let mut cells = cells.lock().expect("cell registry poisoned");
+            let starting = cells
+                .starting
+                .get(cell)
+                .is_some_and(|handle| handle.epoch == epoch)
+                .then(|| cells.starting.remove(cell));
+            let published = cells
+                .published
+                .get(cell)
+                .is_some_and(|handle| handle.epoch == epoch)
+                .then(|| cells.published.remove(cell));
+            (starting, published)
+        };
+        drop(removed);
+        Ok(())
+    }
+
+    #[cfg(all(test, not(celld_internal_tests)))]
+    pub(crate) fn native_handoff_can_reserve(cells: &Arc<Mutex<Self>>, cell: &str) -> bool {
+        PendingCellRuntime::reserve(cells, cell).is_ok()
+    }
+
+    #[cfg(all(test, not(celld_internal_tests)))]
+    pub(crate) fn native_handoff_test_cell(
+        cell: String,
+        epoch: u64,
+        container: crate::container::ContainerActivation,
+        residency: crate::pool::Residency,
+        alarm: celld_logic::wake::AlarmSnapshot,
+    ) -> Self {
+        let mut registry = Self::default();
+        registry.published.insert(
+            cell,
+            CellHandle {
+                epoch,
+                container: Some(container),
+                generation: 0,
+                startup_us: 0,
+                residency,
+                alarm,
+                requests: Arc::new(CellRequestAdmission {
+                    in_flight: AtomicUsize::new(0),
+                    saturated: AtomicBool::new(false),
+                    limit: 1,
+                }),
+            },
+        );
+        registry
+    }
+
+    // prepare under the runtime registry lock, then execute without holding it.
+    pub(crate) fn prepare_container_stop(
+        &self,
+        engine: Option<Arc<crate::container::ContainerEngine>>,
+        cell: &str,
+        epoch: u64,
+        mode: &StopMode,
+    ) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static>
+    {
+        let handle = self
+            .starting
+            .get(cell)
+            .filter(|handle| handle.epoch == epoch)
+            .or_else(|| {
+                self.published
+                    .get(cell)
+                    .filter(|handle| handle.epoch == epoch)
+            });
+        let keep = matches!(
+            mode,
+            StopMode::Evict {
+                preserve_local: true,
+                ..
+            }
+        );
+        let release = match handle.and_then(|handle| handle.container.as_ref()) {
+            Some(activation) => {
+                let engine =
+                    engine.ok_or_else(|| anyhow!("container engine disappeared before release"))?;
+                let mode = if keep {
+                    crate::container::Release::Keep
+                } else {
+                    crate::container::Release::Destroy
+                };
+                let ticket = engine.prepare_runtime_release(activation, mode)?;
+                Some((engine, ticket))
+            }
+            None if !keep => match engine {
+                Some(engine) => engine
+                    .prepare_startup_release(cell, epoch)?
+                    .map(|ticket| (engine, ticket)),
+                None => None,
+            },
+            None => None,
+        };
+        let slots: Vec<_> = [&self.starting, &self.published]
+            .into_iter()
+            .filter_map(|handles| handles.get(cell))
+            .filter(|handle| handle.epoch == epoch)
+            .map(|handle| handle.residency.slot().clone())
+            .collect();
+        let cell = cell.to_string();
+        Ok(async move {
+            // cleanup intent is already retained, but no physical removal precedes
+            // successful dispatch and storage retirement on the exact resident slots.
+            for slot in slots {
+                slot.turn_cell(&cell, |worker| worker.own_cell(&cell, None))
+                    .await
+                    .context("native handoff realm release did not settle")?;
+            }
+            if let Some((engine, ticket)) = release {
+                engine.release(ticket).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+struct PendingCellRuntime {
+    cells: Arc<Mutex<CellRegistry>>,
+    cell: String,
+}
+
+impl PendingCellRuntime {
+    fn reserve(cells: &Arc<Mutex<CellRegistry>>, cell: &str) -> anyhow::Result<Self> {
+        let mut registry = cells.lock().expect("cell registry poisoned");
+        anyhow::ensure!(
+            !registry.pending.contains(cell)
+                && !registry.starting.contains_key(cell)
+                && !registry.published.contains_key(cell),
+            "cell runtime already exists or is pending: {cell}"
+        );
+        registry.pending.insert(cell.to_string());
+        Ok(Self {
+            cells: cells.clone(),
+            cell: cell.to_string(),
+        })
+    }
+}
+
+impl Drop for PendingCellRuntime {
+    fn drop(&mut self) {
+        self.cells
+            .lock()
+            .expect("cell registry poisoned")
+            .pending
+            .remove(&self.cell);
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn native_allocation_pending_runtime_reservation_is_exclusive_and_cancel_safe() {
+    let cells = Arc::new(Mutex::new(CellRegistry::default()));
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let starting = cells.clone();
+    let startup = tokio::spawn(async move {
+        let _pending = PendingCellRuntime::reserve(&starting, "pending-runtime").unwrap();
+        entered.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(PendingCellRuntime::reserve(&cells, "pending-runtime").is_err());
+    let other = PendingCellRuntime::reserve(&cells, "unrelated-runtime").unwrap();
+    startup.abort();
+    assert!(startup.await.err().unwrap().is_cancelled());
+    let retry = PendingCellRuntime::reserve(&cells, "pending-runtime").unwrap();
+    assert!(PendingCellRuntime::reserve(&cells, "pending-runtime").is_err());
+    drop(retry);
+    drop(other);
+    assert!(cells.lock().unwrap().pending.is_empty());
+}
+
+#[cfg(all(test, debug_assertions, unix))]
+#[tokio::test]
+async fn native_allocation_debug_startup_settlement_releases_runtime_reservation() {
+    use crate::allocation_debug::{self as debug, tests as controls, Control};
+    let cells = Arc::new(Mutex::new(CellRegistry::default()));
+    let dir = controls::directory("pending-runtime", "cancel-startup", None, 2000);
+    let control = Control::claim(
+        dir.path(),
+        "pending-runtime",
+        "cancel-startup",
+        None,
+        7,
+        Some(8),
+    )
+    .unwrap();
+    let starting = cells.clone();
+    let startup = tokio::spawn(debug::startup_control(control, async move {
+        let _pending = PendingCellRuntime::reserve(&starting, "pending-runtime")?;
+        debug::post_attach("pending-runtime", 7).await
+    }));
+    controls::ack(dir.path(), "entered.json").await;
+    assert!(PendingCellRuntime::reserve(&cells, "pending-runtime").is_err());
+    controls::signal(dir.path(), "cancel.json");
+    let settled = controls::ack(dir.path(), "settled.json").await;
+    assert_eq!(settled["status"], "cancelled");
+    let _retry = PendingCellRuntime::reserve(&cells, "pending-runtime").unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(5), startup)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
 }
 
 #[derive(Clone)]
@@ -757,6 +998,79 @@ pub(crate) async fn receive_service_fetch_response_for_test(
 }
 
 impl RuntimeManager {
+    #[cfg(all(test, not(celld_internal_tests)))]
+    pub(crate) fn native_handoff_test_runtime(
+        data_dir: std::path::PathBuf,
+        replication: Replication,
+        container: Option<crate::container::ContainerSpec>,
+    ) -> Self {
+        use crate::generation::{DeploymentGraph, GenerationOptions};
+        crate::js::Engine::init();
+        let mut generation = Generation::build(
+            1,
+            DeploymentGraph::single(crate::fleet::LoadedDeployment {
+                options: crate::js::WorkerConfigOptions {
+                    src: "export default { fetch() { return new Response('ok'); } }; export class AllocationTest {}".into(),
+                    script_name: "failed-start-test".into(),
+                    do_classes: if container.is_some() { vec!["AllocationTest".into()] } else { vec![] },
+                    bindings: vec![],
+                    r2_bindings: vec![],
+                    d1_bindings: vec![],
+                    kv_bindings: vec![],
+                    queue_bindings: vec![],
+                    queue_consumers: vec![],
+                    workflow_bindings: vec![],
+                    vars: vec![],
+                    node: "b".into(),
+                    modules: vec![],
+                    compat: Default::default(),
+                },
+                script_name: "failed-start-test".into(),
+                version: "test".into(),
+                prefix: "test".into(),
+                asset_binding: None,
+                loader_bindings: vec![],
+                assets: None,
+                services: vec![],
+                crons: vec![],
+                containers: container.into_iter().collect(),
+                fence_image: None,
+            }),
+            GenerationOptions {
+                node: "b".into(),
+                region: String::new(),
+            },
+        )
+        .unwrap();
+        generation.cell_isolates.insert(
+            "failed-start-test".into(),
+            Arc::new(crate::pool::Pool::new(
+                pool_limits(),
+                Duration::from_secs(5),
+                Box::new(|| Err(anyhow!("injected Worker load failure"))),
+            )),
+        );
+        let core = crate::cell_runtime::CellRuntime::new(
+            Arc::new(generation),
+            data_dir,
+            Some(replication),
+            None,
+            Arc::new(|_, _| {}),
+            "b".into(),
+            String::new(),
+        )
+        .unwrap();
+        let cells = Arc::new(Mutex::new(CellRegistry::default()));
+        Self {
+            alarm_reporter: alarm_reporter(&cells, &core.alarm_observer),
+            core,
+            cells,
+            remote_requests: Default::default(),
+            alarm_requests: Default::default(),
+            max_cell_requests: 1,
+        }
+    }
+
     /// A deployment with no Durable Object classes can never land a Worker fetch
     /// on a cell, so the core's round-robin routing always returns `None`. Lets
     /// the request path skip the core round-trip entirely for stateless workers.
@@ -1224,6 +1538,7 @@ impl RuntimeManager {
         let CellRegistry {
             starting,
             published,
+            ..
         } = &mut *cells;
         for residents in [starting, published] {
             if residents
@@ -1246,6 +1561,21 @@ impl RuntimeManager {
         epoch: u64,
         fresh: bool,
     ) -> anyhow::Result<(celld_logic::isolate::HeapId, GenerationId)> {
+        self.start_cell_with_engine(cell, epoch, fresh, None).await
+    }
+
+    pub(crate) async fn start_cell_with_engine(
+        &self,
+        cell: String,
+        epoch: u64,
+        fresh: bool,
+        engine: Option<Arc<crate::container::ContainerEngine>>,
+    ) -> anyhow::Result<(celld_logic::isolate::HeapId, GenerationId)> {
+        // reserve before attachment, placement or storage adoption can affect another runtime.
+        let _pending = PendingCellRuntime::reserve(&self.cells, &cell)?;
+        if let Some(replication) = &self.replication {
+            replication.ltx().invalidate_native_checkpoint(&cell, epoch);
+        }
         let db_path = self.db_path(&cell, epoch);
         let class = cell
             .split_once(':')
@@ -1255,12 +1585,20 @@ impl RuntimeManager {
         let config = generation
             .cell_config(class)
             .ok_or_else(|| anyhow!("no Worker exports Durable Object class {class}"))?;
-        // The object's `running` is read synchronously, so the engine
-        // answers it here, before the object exists. A container a previous
-        // activation on this node left running is adopted by name.
-        if config.container_class(class) {
-            let engine = crate::container::engine().await?;
-            engine.attach(&cell, class).await?;
+        // observe recorded workload state before startup without transferring its authority.
+        // no container handler runs until this runtime is committed and published.
+        let container = if config.container_class(class) {
+            let engine = match engine {
+                Some(engine) => engine,
+                None => crate::container::engine().await?,
+            };
+            Some(engine.attach_pending(&cell, class, epoch).await?)
+        } else {
+            None
+        };
+        #[cfg(all(debug_assertions, unix))]
+        if container.is_some() {
+            crate::allocation_debug::post_attach(&cell, epoch).await?;
         }
         let startup_timing = CellIsolateStartupTiming {
             started: Instant::now(),
@@ -1343,6 +1681,7 @@ impl RuntimeManager {
                 cell.clone(),
                 CellHandle {
                     epoch,
+                    container: container.map(|pending| pending.commit()),
                     generation: generation.id,
                     startup_us,
                     residency,
@@ -1400,63 +1739,65 @@ impl RuntimeManager {
         epoch: u64,
         mode: StopMode,
     ) -> anyhow::Result<()> {
+        self.stop_cell_with_engine(cell, epoch, mode, crate::container::engine_if_ready())
+            .await
+    }
+
+    pub(crate) async fn stop_cell_with_engine(
+        &self,
+        cell: &str,
+        epoch: u64,
+        mode: StopMode,
+        engine: Option<Arc<crate::container::ContainerEngine>>,
+    ) -> anyhow::Result<()> {
+        let mode = if matches!(mode, StopMode::DormantRelease) {
+            {
+                let cells = self.cells.lock().expect("cell registry poisoned");
+                anyhow::ensure!(
+                    !cells.pending.contains(cell)
+                        && !cells.starting.contains_key(cell)
+                        && !cells.published.contains_key(cell),
+                    "dormant retirement still has a runtime"
+                );
+            }
+            let native = match self
+                .replication
+                .as_ref()
+                .and_then(|replication| replication.ltx().native_ownership())
+            {
+                Some(ownership) => ownership.dormant_native_owner(cell, epoch).await?,
+                None => None,
+            };
+            if let Some(native) = &native {
+                if !native.journal.is_empty() {
+                    let engine = engine
+                        .as_ref()
+                        .context("dormant native engine is unavailable")?;
+                    if let Some(ticket) =
+                        engine.prepare_dormant_native_release(cell, epoch, &native.journal)?
+                    {
+                        engine.release(ticket).await?;
+                    }
+                }
+            }
+            if native
+                .as_ref()
+                .is_some_and(|native| native.restore.is_some())
+            {
+                StopMode::CloseInPlace
+            } else {
+                StopMode::Evict {
+                    preserve_local: false,
+                    abandon: None,
+                }
+            }
+        } else {
+            mode
+        };
         // No facet opens once the stop begins; the facet loop below stops
         // the streams this answers again, with any that opened before.
         self.facets.stopping(cell, epoch);
-        if let Some(engine) = crate::container::engine_if_ready() {
-            // Only an idle eviction keeps the cell on this node, so only it
-            // keeps the container: the next activation here reconnects.
-            let release = match &mode {
-                StopMode::Evict {
-                    preserve_local: true,
-                    ..
-                } => crate::container::Release::Keep,
-                _ => crate::container::Release::Destroy,
-            };
-            engine.release(cell, release).await;
-        }
-        let mut stopped = Vec::new();
-        {
-            let mut cells = self.cells.lock().expect("cell registry poisoned");
-            if cells
-                .starting
-                .get(cell)
-                .is_some_and(|handle| handle.epoch == epoch)
-            {
-                if let Some(handle) = cells.starting.remove(cell) {
-                    stopped.push(handle);
-                }
-            }
-            if cells
-                .published
-                .get(cell)
-                .is_some_and(|handle| handle.epoch == epoch)
-            {
-                if let Some(handle) = cells.published.remove(cell) {
-                    stopped.push(handle);
-                }
-            }
-        }
-        for handle in stopped {
-            // Give the cell back rather than shutting the isolate down: it
-            // serves other cells. Taking the isolate for this turn is the
-            // barrier — an event of this cell either finished its turn
-            // before it, or has not started one — so closing its SQLite
-            // cannot land under a handler that is mid-turn.
-            // The cell's own lane, not the shared stateless one: this stop
-            // follows the turns already admitted for this cell, and it does
-            // not wait behind every stateless turn queued on the isolate. On
-            // a loaded node that queue held a handoff batch for minutes.
-            let _ = handle
-                .residency
-                .slot()
-                .turn_cell(cell, |worker| worker.own_cell(cell, None))
-                .await;
-            // Dropping the handle drops its residency, which is what gives
-            // the isolate its place back — and what lets `retire` reclaim
-            // the isolate once no cell is left in it.
-            drop(handle);
-        }
+        CellRegistry::retire(&self.cells, engine, cell, epoch, &mode).await?;
         // After the give-back, so the root cannot start another facet call,
         // and before the facet streams stop, so no write reaches a file that
         // the facet's eviction unlinked.
@@ -1497,6 +1838,7 @@ impl RuntimeManager {
                     replication.ltx().discard(cell, epoch);
                     Ok(())
                 }
+                StopMode::DormantRelease => unreachable!("dormant mode resolved before retirement"),
             }
         };
         let stop_facet = |facet: String| {
@@ -1523,6 +1865,9 @@ impl RuntimeManager {
                         replication.ltx().discard(&facet, epoch);
                         Ok(())
                     }
+                    StopMode::DormantRelease => {
+                        unreachable!("dormant mode resolved before retirement")
+                    }
                 }
             }
         };
@@ -1535,6 +1880,34 @@ impl RuntimeManager {
                 stop_facet,
             )
             .await
+    }
+
+    pub(crate) async fn native_handoff_closure(
+        &self,
+        cell: &str,
+        epoch: u64,
+        engine: Arc<crate::container::ContainerEngine>,
+    ) -> anyhow::Result<(
+        crate::native_handoff::Checkpoint,
+        Vec<crate::native_handoff::DestroyedAttempt>,
+    )> {
+        {
+            let cells = self.cells.lock().expect("cell registry poisoned");
+            anyhow::ensure!(
+                !cells.pending.contains(cell)
+                    && !cells.starting.contains_key(cell)
+                    && !cells.published.contains_key(cell),
+                "native handoff still has a runtime"
+            );
+        }
+        let attempts = engine.close_native_handoff(cell, epoch).await?;
+        let checkpoint = self
+            .replication
+            .as_ref()
+            .context("native handoff requires replication")?
+            .ltx()
+            .native_closed_checkpoint(cell, epoch)?;
+        Ok((checkpoint, attempts))
     }
 
     pub async fn fetch_cell(

@@ -18,17 +18,7 @@ use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[derive(Serialize)]
-struct OwnerWire<'a> {
-    node: &'a str,
-    epoch: u64,
-}
-
-#[derive(Deserialize)]
-struct OwnerWireOwned {
-    node: String,
-    epoch: u64,
-}
+use crate::native_handoff::OwnerWire;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(from = "NodeLeaseWireRaw")]
@@ -577,13 +567,17 @@ impl BucketOwnership {
     }
 
     /// Stable identity for this exact lease-writing process.
+    pub(crate) fn node_name(&self) -> &str {
+        &self.node
+    }
+
     pub fn process_generation(&self) -> Option<&str> {
         (!self.probe_public_key.is_empty()).then_some(self.probe_public_key.as_str())
     }
 
     pub async fn read_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
         let key = format!("cells/{cell}/own.json");
-        let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
+        let Some((owner, etag)) = load_json::<OwnerWire>(&self.bucket, &key).await? else {
             return Ok(None);
         };
         let record = OwnerRecord {
@@ -939,7 +933,18 @@ impl BucketOwnership {
             return Ok(CasOutcome::Rejected);
         }
         let key = format!("cells/{cell}/own.json");
-        let body = serde_json::to_vec(&OwnerWire { node: "", epoch })?;
+        let (wire, _) = crate::native_handoff::read_owner(&self.bucket, cell)
+            .await?
+            .context("release owner disappeared")?;
+        anyhow::ensure!(
+            wire.native.is_none(),
+            "native ownership requires exact closure before release"
+        );
+        let body = serde_json::to_vec(&OwnerWire {
+            node: String::new(),
+            epoch,
+            native: None,
+        })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
             None => Ok(CasOutcome::Rejected),
@@ -953,9 +958,51 @@ impl BucketOwnership {
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
         let key = format!("cells/{cell}/own.json");
+        let native = match &guard {
+            CasGuard::Absent => None,
+            CasGuard::Match(expected) => {
+                let Some((current, etag)) =
+                    crate::native_handoff::read_owner(&self.bucket, cell).await?
+                else {
+                    return Ok(CasOutcome::Rejected);
+                };
+                if &etag != expected {
+                    return Ok(CasOutcome::Rejected);
+                }
+                let recovered_journal = if current.node == self.node
+                    && current.native.as_ref().is_some_and(|native| {
+                        Some(native.generation.as_str()) != self.process_generation()
+                            && !native.journal.is_empty()
+                    }) {
+                    // the journal's exclusive executor lock is held by this engine for its lifetime.
+                    Some(
+                        crate::container::engine()
+                            .await?
+                            .native_journal_identity()?,
+                    )
+                } else {
+                    None
+                };
+                crate::asyncrt::timeout(
+                    crate::native_handoff::DEADLINE,
+                    crate::native_handoff::claim_native(
+                        &self.bucket,
+                        cell,
+                        &current,
+                        &self.node,
+                        self.process_generation().unwrap_or(""),
+                        epoch,
+                        recovered_journal.as_deref(),
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("native claim proof deadline exceeded"))??
+            }
+        };
         let body = serde_json::to_vec(&OwnerWire {
-            node: &self.node,
+            node: self.node.clone(),
             epoch,
+            native,
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,

@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use std::sync::Weak;
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use celld_ltx::client::epochs::EpochChain;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
@@ -56,6 +56,10 @@ use crate::replication::StorageCredentials;
 use crate::replication::SyncWait;
 use crate::replication::{EvictionAbandon, EvictionRestoreArtifact};
 use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
+
+#[cfg(all(test, not(celld_internal_tests)))]
+#[path = "ltx_native_handoff_tests.rs"]
+pub(crate) mod native_handoff_tests;
 
 /// Max cells uploading concurrently across the node. Caps blocking-pool threads
 /// and in-flight object-store requests under high write fan-out.
@@ -868,11 +872,10 @@ struct HandoffSnapshot {
 /// and, because a sync credits only tickets whose writes committed before it
 /// started (which the sync's `db.sync` captures), never one it did not upload.
 struct Cell {
-    /// A handoff snapshot of this cell did not publish inside the durability
-    /// deadline, or its size showed that it cannot. Every later eviction of
-    /// this epoch proves durability through the L0 chain instead of building
-    /// and timing out on the same snapshot again.
+    // only an unsupported snapshot size declines later captures, never a transport failure.
     snapshot_declined: AtomicBool,
+    // retain the exact imported lineage until baseline publication and its owner cas settle.
+    native_restore: Mutex<Option<String>>,
     /// The paged VFS registered for this activation (paged restore only). The
     /// local db is then a sparse cache of the cut: every reader of the file
     /// must go through this VFS, the file is not a reusable eviction baseline,
@@ -1246,6 +1249,9 @@ pub struct LtxRepl {
     vfs_name: Option<String>,
     cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>,
     stopped_cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>>,
+    native_closed_checkpoints: Mutex<BTreeMap<(String, u64), crate::native_handoff::Checkpoint>>,
+    #[cfg(test)]
+    native_ownership_for_test: Option<Arc<crate::ownership_store::BucketOwnership>>,
     /// Serializes a release admission with the final shutdown snapshot. A
     /// release that crosses shutdown must belong to either the retained close
     /// group or the stopped-cell snapshot, never neither and never both.
@@ -1355,6 +1361,14 @@ pub struct LtxRepl {
 }
 
 impl LtxRepl {
+    pub(crate) fn native_ownership(&self) -> Option<Arc<crate::ownership_store::BucketOwnership>> {
+        #[cfg(test)]
+        if let Some(ownership) = &self.native_ownership_for_test {
+            return Some(ownership.clone());
+        }
+        crate::native_handoff::ownership()
+    }
+
     /// Cfg-gated constructor over an injected store.
     #[cfg(celld_internal_tests)]
     pub fn start_with_store_for_test(watch: &Path, store: Arc<dyn ObjectStore>) -> Self {
@@ -1595,6 +1609,9 @@ impl LtxRepl {
             vfs_name,
             cells,
             stopped_cells: Arc::new(Mutex::new(BTreeMap::new())),
+            native_closed_checkpoints: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            native_ownership_for_test: None,
             replica_close_gate: Mutex::new(()),
             failed_release_closes: Arc::new(Mutex::new(BTreeSet::new())),
             replica_close_stop,
@@ -2368,6 +2385,93 @@ impl LtxRepl {
         // database can contain rows which a crash or self-fence staged but did
         // not upload, so its local position needs a remote bound.
         let dst_existed = is_file(&dst);
+        let resident = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned();
+        let pending_restore = resident
+            .as_ref()
+            .and_then(|handle| handle.native_restore.lock().unwrap().clone());
+        let native_ownership = self.native_ownership();
+        let native = match &native_ownership {
+            Some(ownership) => ownership.native_owner(cell).await?,
+            None => None,
+        };
+        let certified = if let (Some(ownership), Some(native)) = (&native_ownership, &native) {
+            anyhow::ensure!(
+                native.node == ownership.node_name()
+                    && native.epoch == epoch
+                    && Some(native.generation.as_str()) == ownership.process_generation()
+                    && native.closed.is_none(),
+                "native restore owner is not authoritative"
+            );
+            if let Some(hash) = native.restore.as_ref().or(pending_restore.as_ref()) {
+                let bucket = ownership.bucket_client();
+                let closure = crate::native_handoff::load_closure(&bucket, cell, hash).await?;
+                anyhow::ensure!(
+                    closure.epoch < epoch && native.head.as_ref() == Some(hash),
+                    "native restore lineage is invalid"
+                );
+                let bytes =
+                    crate::native_handoff::load_checkpoint(&bucket, cell, &closure.checkpoint)
+                        .await?;
+                Some((hash.clone(), bytes))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(native) = &native {
+            // Actor retries claim a new writer epoch, rather than retrying
+            // activate at the failed epoch. Retire only superseded restores
+            // that never admitted a runtime. Keep their files and any tail
+            // obligations, and use the close owner's cancellation-safe path.
+            let superseded: BTreeSet<_> = {
+                let _close_gate = self.replica_close_gate.lock().unwrap();
+                let cells = self.cells.lock().unwrap();
+                let stopped = self.stopped_cells.lock().unwrap();
+                cells
+                    .iter()
+                    .chain(stopped.iter())
+                    .filter(|((scope, old_epoch), handle)| {
+                        scope == cell
+                            && *old_epoch < native.epoch
+                            && handle.native_restore.lock().unwrap().is_some()
+                    })
+                    .map(|((_, old_epoch), _)| *old_epoch)
+                    .collect()
+            };
+            for old_epoch in superseded {
+                self.close_in_place(cell, old_epoch).await?;
+            }
+        }
+        if let Some(handle) = resident.filter(|_| pending_restore.is_some()) {
+            let (hash, _) = certified
+                .as_ref()
+                .context("native restore retry has no certified lineage")?;
+            anyhow::ensure!(
+                !fresh && !resume_local && pending_restore.as_ref() == Some(hash),
+                "resident native restore is not the pending certified activation"
+            );
+            self.complete_native_restore(
+                cell,
+                epoch,
+                &handle,
+                native_ownership
+                    .as_ref()
+                    .context("native restore adapter disappeared")?,
+                hash,
+            )
+            .await?;
+            return Ok(ActivationResult {
+                path: dst,
+                restored: true,
+                vfs: None,
+            });
+        }
         let mut restored = resume_local;
         let mut remote_restore = None;
         let mut paged_vfs_name: Option<String> = None;
@@ -2375,7 +2479,18 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
-        if resume_local {
+        if let Some((_, bytes)) = &certified {
+            anyhow::ensure!(
+                !fresh && !resume_local && !dst_existed,
+                "certified native restore cannot replace existing actor data or initialise fresh"
+            );
+            let host = self.ltx_host.clone();
+            let path = dst.clone();
+            let bytes = bytes.clone();
+            asyncrt::blocking(move || replica::restore_certified_snapshot(&host, &path, bytes))
+                .await??;
+            restored = true;
+        } else if resume_local {
             anyhow::ensure!(
                 is_file(&dst),
                 "clean reload database is missing: {}",
@@ -2564,6 +2679,10 @@ impl LtxRepl {
             }
         }
 
+        anyhow::ensure!(
+            native.is_none() || restored,
+            "protected native control state is missing; refusing fresh initialisation"
+        );
         let remote_seed = if !restored && dst_existed {
             Some(self.contiguous_covered_txid(cell, epoch).await?)
         } else {
@@ -2666,6 +2785,7 @@ impl LtxRepl {
             });
         let handle = Arc::new(Cell {
             snapshot_declined: AtomicBool::new(false),
+            native_restore: Mutex::new(certified.as_ref().map(|(hash, _)| hash.clone())),
             paged_vfs: paged_vfs_name.clone(),
             hydration: hydration.clone(),
             replica: Mutex::new(Some(replica)),
@@ -2776,6 +2896,18 @@ impl LtxRepl {
             }
             anyhow::bail!("LTX replication stopped before activation installed");
         }
+        if let Some((hash, _)) = certified {
+            self.complete_native_restore(
+                cell,
+                epoch,
+                &handle,
+                native_ownership
+                    .as_ref()
+                    .context("native restore adapter disappeared")?,
+                &hash,
+            )
+            .await?;
+        }
         if let Some(pos) = seed {
             maybe_queue_compaction(&handle, pos.txid.0);
         }
@@ -2788,6 +2920,33 @@ impl LtxRepl {
             restored,
             vfs: paged_vfs_name,
         })
+    }
+
+    async fn complete_native_restore(
+        &self,
+        cell: &str,
+        epoch: u64,
+        handle: &CellHandle,
+        ownership: &crate::ownership_store::BucketOwnership,
+        hash: &str,
+    ) -> anyhow::Result<()> {
+        // cancellation retains both this handle and its obligation. retry never
+        // reimports over actor data, and admission stays closed until the cas settles.
+        anyhow::ensure!(
+            handle.native_restore.lock().unwrap().as_deref() == Some(hash),
+            "native restore obligation changed"
+        );
+        let (snapshot, _pause) = self.prepare_handoff_snapshot(handle).await?;
+        let snapshot = snapshot.context("native restored baseline has no full checkpoint")?;
+        self.publish_handoff_snapshot(cell, epoch, &snapshot)
+            .await?;
+        anyhow::ensure!(
+            self.epoch_replicated(cell, epoch).await,
+            "native restored baseline is not remotely visible"
+        );
+        ownership.finish_native_restore(cell, epoch, hash).await?;
+        *handle.native_restore.lock().unwrap() = None;
+        Ok(())
     }
 
     /// The paged VFS name of a resident activation, when its restore paged.
@@ -3372,6 +3531,10 @@ impl LtxRepl {
         // cell's lifetime. One full snapshot has constant object count and
         // gives the successor the same closed database.
         let barrier_started_mono_ms = asyncrt::mono_ms();
+        let native_ownership = match self.native_ownership() {
+            Some(ownership) if ownership.native_owner(cell).await?.is_some() => Some(ownership),
+            _ => None,
+        };
         let handle = self
             .cells
             .lock()
@@ -3411,9 +3574,33 @@ impl LtxRepl {
                 // A failed snapshot does not credit: the L0 fallback reads
                 // `durable_txid` to choose which rows to upload.
                 credit_percell_upload(&handle, snapshot.max_txid.0);
+                if let Some(ownership) = &native_ownership {
+                    let checkpoint = asyncrt::timeout_at(
+                        deadline,
+                        crate::native_handoff::publish_checkpoint(
+                            &ownership.bucket_client(),
+                            cell,
+                            epoch,
+                            snapshot.max_txid.0,
+                            &snapshot.data,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("native checkpoint publication deadline exceeded"))??;
+                    self.native_closed_checkpoints
+                        .lock()
+                        .unwrap()
+                        .insert((cell.to_string(), epoch), checkpoint);
+                }
                 artifact = Some(EvictionRestoreArtifact::Snapshot);
             } else {
-                handle.snapshot_declined.store(true, Ordering::Relaxed);
+                // transport and visibility failures do not change snapshot eligibility.
+                // the closed handle stays available for a fresh publication attempt.
+                if native_ownership.is_some() {
+                    return Err(anyhow!(
+                        "native control snapshot publication or visibility failed; retry required"
+                    ));
+                }
                 warn!(
                     event = "eviction_snapshot_fallback",
                     cell,
@@ -3425,6 +3612,10 @@ impl LtxRepl {
         let artifact = match artifact {
             Some(artifact) => artifact,
             None => {
+                anyhow::ensure!(
+                    native_ownership.is_none(),
+                    "native cooperative handoff requires a complete bounded control snapshot"
+                );
                 let remaining_ms = deadline.saturating_sub(asyncrt::mono_ms());
                 if remaining_ms == 0
                     || !matches!(
@@ -3463,6 +3654,26 @@ impl LtxRepl {
         }
         self.remove_local(cell, epoch, preserve_local);
         Ok(artifact)
+    }
+
+    pub(crate) fn invalidate_native_checkpoint(&self, cell: &str, epoch: u64) {
+        self.native_closed_checkpoints
+            .lock()
+            .unwrap()
+            .remove(&(cell.to_string(), epoch));
+    }
+
+    pub(crate) fn native_closed_checkpoint(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<crate::native_handoff::Checkpoint> {
+        self.native_closed_checkpoints
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+            .context("native handoff has no closed authoritative control snapshot")
     }
 
     async fn final_durability_barrier(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
@@ -3730,8 +3941,8 @@ impl LtxRepl {
 
     /// Capture one full snapshot after the runtime closes.
     ///
-    /// A retry reuses these bytes. Recreating the image for each failed PUT
-    /// would spend local I/O without changing the closed database.
+    /// a retry regenerates the image from the retained closed database.
+    /// only unsupported layouts or the size budget decline a full snapshot.
     ///
     /// The returned pause holds compaction off until the caller drops it or
     /// hands the cell off. It comes back with the snapshot because a

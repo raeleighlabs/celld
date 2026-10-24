@@ -26,6 +26,12 @@ pub struct OutboundWsReq {
     /// A `fetch()` upgrade wants the whole handshake outcome, including the
     /// ordinary response a server that declines to upgrade sent instead.
     pub want_response: bool,
+    // a consumed fetch upgrade resumes its existing transport, never redials.
+    pub connection: Option<crate::native_ws::NativeUpgrade>,
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
+    pub owner_cancel: Option<crate::native_ws::NativeOwner>,
+    pub native_closed: Option<tokio::sync::oneshot::Sender<crate::native_ws::NativeClose>>,
+    pub registration: Option<WsRegistrationGuard>,
     /// A socket already upgraded in this process, which this request joins
     /// instead of dialing `url`. It is the cell end of a Durable Object
     /// subrequest whose caller kept the client end, so there is no handshake
@@ -51,6 +57,7 @@ pub struct DeclinedUpgrade {
 pub struct OutboundWsOpen {
     pub protocol: Option<String>,
     pub declined: Option<DeclinedUpgrade>,
+    pub connection: Option<crate::native_ws::NativeUpgrade>,
 }
 
 /// Outbound WebSocket traffic from a DO's `ws.send`/`ws.close`. The host holds
@@ -538,6 +545,9 @@ pub struct WsRegistry {
     pub(crate) outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
     pub metadata: HashMap<u64, WsMeta>,
     pub(crate) worker_handoffs: HashMap<u64, WsPullSender>,
+    native_revocations: HashMap<u64, tokio_util::sync::CancellationToken>,
+    lifecycle_revoked: std::collections::HashSet<u64>,
+    native_admissions: HashMap<u64, u64>,
 }
 impl WsRegistry {
     #[doc(hidden)]
@@ -550,7 +560,24 @@ impl WsRegistry {
         self.outputs.insert(id, tx);
     }
 
+    fn revoke_native(&mut self, id: u64) -> bool {
+        if self.metadata.contains_key(&id) {
+            self.lifecycle_revoked.insert(id);
+        }
+        if let Some(cancel) = self.native_revocations.get(&id) {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     fn unregister(&mut self, id: u64) -> Option<WsMeta> {
+        self.lifecycle_revoked.remove(&id);
+        self.native_admissions.remove(&id);
+        if let Some(cancel) = self.native_revocations.remove(&id) {
+            cancel.cancel();
+        }
         self.outputs.remove(&id);
         self.metadata.remove(&id)
     }
@@ -616,7 +643,10 @@ pub(crate) fn increment_regular_ws(scope: &str) {
         .or_default() += 1;
 }
 pub(crate) fn decrement_regular_ws(scope: &str) {
-    let counts = regular_ws_counts();
+    decrement_regular_ws_from(&regular_ws_counts(), scope);
+}
+
+fn decrement_regular_ws_from(counts: &std::sync::Mutex<HashMap<String, usize>>, scope: &str) {
     let mut counts = counts.lock().unwrap();
     let Some(count) = counts.get_mut(scope) else {
         return;
@@ -801,10 +831,83 @@ pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
         increment_regular_ws(scope);
     }
 }
+// capture the owning service, so executor cancellation cannot clean up an id
+// in whichever instance happens to be current when the future is dropped.
+pub fn ws_register_native(
+    id: u64,
+    scope: &str,
+    facet: Option<FacetSocket>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> WsRegistrationGuard {
+    ws_register_outbound(id, scope, facet);
+    {
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
+        if !registry.metadata.contains_key(&id) || registry.lifecycle_revoked.contains(&id) {
+            cancel.cancel();
+        }
+        registry.native_revocations.insert(id, cancel);
+    }
+    WsRegistrationGuard::new(id)
+}
+
+// a native response can return to its admitting actor with a new js handle.
+// routing must use the physical transport's existing core admission.
+pub fn ws_link_native_admission(handle: u64, admission: u64) {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .native_admissions
+        .insert(handle, admission);
+}
+
+pub fn ws_admission_id(handle: u64) -> u64 {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .native_admissions
+        .get(&handle)
+        .copied()
+        .unwrap_or(handle)
+}
+
+pub struct WsRegistrationGuard {
+    id: u64,
+    registry: Arc<std::sync::Mutex<WsRegistry>>,
+    pull: Arc<WsPullRegistry>,
+    counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+}
+
+impl WsRegistrationGuard {
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            registry: ws_registry(),
+            pull: ws_pull(),
+            counts: regular_ws_counts(),
+        }
+    }
+}
+
+impl Drop for WsRegistrationGuard {
+    fn drop(&mut self) {
+        self.pull.lock().unwrap().remove(&self.id);
+        ws_unregister_from(self.id, &self.registry, &self.counts);
+    }
+}
+
 pub fn ws_unregister(id: u64) {
-    let meta = ws_registry().lock().unwrap().unregister(id);
+    ws_unregister_from(id, &ws_registry(), &regular_ws_counts());
+}
+
+fn ws_unregister_from(
+    id: u64,
+    registry: &std::sync::Mutex<WsRegistry>,
+    counts: &std::sync::Mutex<HashMap<String, usize>>,
+) {
+    let meta = registry.lock().unwrap().unregister(id);
     if let Some(meta) = meta.filter(|meta| !meta.hibernatable) {
-        decrement_regular_ws(&meta.scope);
+        decrement_regular_ws_from(counts, &meta.scope);
     }
 }
 
@@ -1295,10 +1398,11 @@ pub fn ws_emit_batch(frames: impl Into<WsBatch>) {
 /// cell stays on this node, so its hibernatable sockets and auto-response
 /// pair survive, which `ws_close_scope` would take with it.
 pub fn ws_close(id: u64, code: u16, reason: &str) {
-    ws_registry()
-        .lock()
-        .unwrap()
-        .emit(id, WsOut::Close(code, reason.to_string()));
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    if !registry.revoke_native(id) {
+        registry.emit(id, WsOut::Close(code, reason.to_string()));
+    }
 }
 
 /// Break a cell's sockets: the output gate could not prove a write durable, so
@@ -1325,7 +1429,9 @@ pub fn ws_close_scope(scope: &str, code: u16, reason: &str) {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            registry.emit(id, WsOut::Close(code, reason.to_string()));
+            if !registry.revoke_native(id) {
+                registry.emit(id, WsOut::Close(code, reason.to_string()));
+            }
         }
     }
     // A reset cell is a new actor; workerd's hibernation manager dies with
@@ -1355,6 +1461,8 @@ pub(crate) fn ws_close_facet(scope: &str, reason: &str) {
         .map(|(id, _)| *id)
         .collect();
     for id in ids {
-        registry.emit(id, WsOut::Close(1001, reason.to_string()));
+        if !registry.revoke_native(id) {
+            registry.emit(id, WsOut::Close(1001, reason.to_string()));
+        }
     }
 }

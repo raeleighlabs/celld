@@ -40,6 +40,56 @@ the container. A fetch with an `Upgrade: websocket` header gives a 101 response
 with a `webSocket`, as on Cloudflare. The node logs a failed `start()` as
 `container_start_failed`.
 
+### Native allocations in this fork
+
+This fork also provides three promise-based methods on `ctx.container`:
+
+- `startAllocation({ id, image, engineImage, platform, env?, entrypoint?, enableInternet? })`
+  starts a journalled attempt using a prepared local image. `image` is a
+  `celld-image:` identity, `engineImage` is an immutable `sha256:` engine ID,
+  and `platform` is `linux/amd64` or `linux/arm64`.
+- `inspectAllocation(id)` observes the retained attempt without starting a
+  replacement.
+- `destroyAllocation(id)` records cleanup intent and removes only the exact
+  allocation owned by that attempt.
+
+Results include the attempt ID, status and image identities. `running` means
+the process is running, not that the application is ready. Only `destroyed`
+confirms settled removal. Unknown create or delete outcomes retain their
+responsibility and block conflicting replacement. Reusing an ID with changed
+inputs is refused. Legacy `destroy()` and `signal()` cannot mutate a native
+allocation.
+
+The local allocation journal survives a same-node restart. Preserve it and
+the node identity. Unrecorded containers are not adopted or deleted by name.
+Failed or cancelled activation retains existing ownership until startup
+commits. Retired activations cannot start new native, storage or outbound
+effects, though previously admitted external requests may continue.
+
+Container WebSocket upgrades preserve native socket ownership and negotiated
+subprotocols when forwarded through an object and Worker. They do not use a
+JavaScript relay. A connection does not survive container removal or hand-off.
+
+### Cooperative hand-off
+
+Native allocations protect the existing owner record before dispatch. Release
+requires settled exact allocation destruction and a final certified actor
+checkpoint before the existing owner CAS can transfer authority. The successor
+verifies that proof before activation. Lease expiry alone does not authorise
+takeover of an unreachable protected owner. Such requests return HTTP 503 with
+code `cooperative-retirement-required`.
+
+A cold successor that has not completed restore can release its inherited
+certified checkpoint through the same CAS. Missing or invalid evidence fails
+closed. Unsupported paged or oversized control snapshots refuse hand-off.
+Application state outside the actor checkpoint still needs its own checkpoint
+or replication protocol. This does not provide exactly-once external effects.
+
+Protected owner records use a tagged epoch that older runtimes refuse to read.
+Older allocation journals have no automatic migration. The original Grapefuit
+live checks used two nodes on one physical machine. Independent-host survival
+and forced takeover are not qualified by those checks.
+
 `@cloudflare/containers` runs as published, including the `sleepAfter` alarm,
 `getContainer()`, `getRandom()`, and `switchPort()`. `@cloudflare/sandbox` also
 runs as published on the `cloudflare/sandbox` image, over the HTTP and the RPC
@@ -54,9 +104,10 @@ credentials that the application passes. See the
 with the `docker` CLI on `PATH` or the CLI that `CELLD_DOCKER` names. A Podman
 CLI works. It saves the image to `deploy/images/<key>.tar` in the fleet bucket,
 where the key hashes the image layers and config, so a redeploy of an unchanged
-image uploads nothing. A node loads the image into its own engine the first time
-a cell of the class starts, and never contacts a registry. The `celld-fence`
-image rides with every deployment that has a container.
+image uploads nothing. The `celld-fence` image rides with every deployment that
+has a container. In this fork, runtime start requires the image to be preloaded
+in the local engine. It does not lazily import the archive or pull from a registry.
+This requirement applies to both native allocation and legacy `start()`.
 
 `celld deploy` builds and pulls for `linux/amd64`, as Wrangler does.
 `CELLD_CONTAINER_PLATFORM` selects another platform. `celld dev` builds for the
@@ -77,9 +128,11 @@ a virtual machine. celld drops all Linux capabilities, sets
 container to 1024 processes, and runs an init as PID 1 that reaps orphans. Two
 containers on one node cannot connect to each other.
 
-Before the first container starts, the node installs nftables rules on its
-container bridges through a one-shot privileged container of the `celld-fence`
-image. A container with `enableInternet: true` reaches the Internet, but not
+Before the first container starts, the host must prepare the container bridges
+and install the stock nftables rules using the `celld-fence` helper. Runtime
+start verifies the prepared bridges and fence, and refuses missing preparation
+rather than launching a privileged helper. A container with
+`enableInternet: true` reaches the Internet, but not
 the node, another node, the private ranges `10/8`, `172.16/12`, `192.168/16`,
 and `100.64/10`, or the link-local range. A node that cannot install the rules
 starts no container, and a deployment from a celld without the fence image
@@ -106,9 +159,11 @@ the operator sets `CELLD_CONTAINER_DNS`.
 
 `setInactivityTimeout()` sets the idle window, and the default is 10 minutes, as
 on Cloudflare. An idle eviction of the cell keeps the container running for that
-window, and the next activation on the same node reconnects to it. A move to
-another node, a node restart, a reset, and a node stop destroy the container.
-Ctrl-C on `celld dev` destroys the containers and keeps the local state.
+window, and the next activation on the same node reconnects to it. Native
+allocations retain exact journalled ownership across same-node restart and
+failed activation. Cooperative release settles their destruction before moving
+the cell. Shutdown retains unresolved cleanup responsibility rather than
+claiming removal. Ctrl-C keeps the local state.
 
 `instance_type` accepts `lite` and its older name `dev`, `basic`, `standard-1`
 and its alias `standard`, `standard-2`, `standard-3`, and `standard-4`, with the

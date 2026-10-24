@@ -828,6 +828,138 @@ fn event_context(scope: &mut v8::PinScope) -> Arc<IoContext> {
     current_reaction_io_context(scope).unwrap_or_else(current_context)
 }
 
+const RETIRED_EFFECT: &str = "actor continuation is retired";
+
+#[derive(Clone)]
+struct ActorEffectOrigin {
+    activations: Weak<crate::native_ws::ActivationUpgrades>,
+    cell: String,
+    #[cfg(all(debug_assertions, unix))]
+    epoch: Option<u64>,
+    owner: Arc<crate::native_ws::PendingUpgrades>,
+}
+
+impl ActorEffectOrigin {
+    fn capture(scope: &mut v8::PinScope, context: &IoContext) -> Result<Option<Self>, String> {
+        let Some(frame) = current_cell_event(context) else {
+            if context.native_actor_upgrades.get().is_some() {
+                return Err(RETIRED_EFFECT.to_string());
+            }
+            return Ok(None);
+        };
+        let origin = Self {
+            activations: Arc::downgrade(&actor_runtime_state(scope).native_activations),
+            cell: frame.storage,
+            #[cfg(all(debug_assertions, unix))]
+            epoch: frame.epoch,
+            owner: context.native_upgrades(),
+        };
+        origin.admit(|| ())?;
+        Ok(Some(origin))
+    }
+
+    fn admit<R>(&self, action: impl FnOnce() -> R) -> Result<R, String> {
+        self.activations
+            .upgrade()
+            .ok_or_else(|| RETIRED_EFFECT.to_string())?
+            .admit(&self.cell, &self.owner, action)
+    }
+}
+
+fn admit_actor_effect<R>(
+    origin: Option<&ActorEffectOrigin>,
+    action: impl FnOnce() -> R,
+) -> Result<R, String> {
+    match origin {
+        Some(origin) => origin.admit(action),
+        None => Ok(action()),
+    }
+}
+
+#[derive(Default)]
+struct FetchGatePermit {
+    #[cfg(all(debug_assertions, unix))]
+    control: Option<crate::allocation_debug::FetchGate>,
+}
+
+impl FetchGatePermit {
+    fn admit<R>(
+        &mut self,
+        origin: Option<&ActorEffectOrigin>,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, String> {
+        let result = admit_actor_effect(origin, || {
+            #[cfg(all(debug_assertions, unix))]
+            if self
+                .control
+                .as_ref()
+                .is_some_and(|control| control.expired())
+            {
+                return None;
+            }
+            Some(action())
+        });
+        #[cfg(all(debug_assertions, unix))]
+        if let Some(control) = self.control.as_mut() {
+            match &result {
+                Ok(None) => control.timed_out()?,
+                Ok(Some(_)) => control.admission(true)?,
+                Err(_) => control.admission(false)?,
+            }
+        }
+        result?.ok_or_else(|| "debug fetch gate timed out before admission".to_string())
+    }
+}
+
+async fn await_fetch_gate(
+    gate: EgressGate,
+    origin: Option<&ActorEffectOrigin>,
+) -> Result<FetchGatePermit, String> {
+    #[cfg(all(debug_assertions, unix))]
+    if let Some(origin) = origin {
+        if let Some(epoch) = origin.epoch {
+            if let Some(mut control) =
+                crate::allocation_debug::FetchGate::claim(&origin.cell, epoch)
+                    .map_err(|error| error.to_string())?
+            {
+                control
+                    .wait(gate.is_gated(), await_egress_gate(gate))
+                    .await?;
+                return Ok(FetchGatePermit {
+                    control: Some(control),
+                });
+            }
+        }
+    }
+    await_egress_gate(gate).await?;
+    admit_actor_effect(origin, || ())?;
+    Ok(FetchGatePermit::default())
+}
+
+// first polling, not constructing a lazy send future, admits the request.
+// retirement after admission does not prove that the remote effect stopped.
+async fn admit_fetch<F: std::future::Future>(
+    origin: Option<&ActorEffectOrigin>,
+    permit: &mut FetchGatePermit,
+    send: F,
+) -> Result<F::Output, String> {
+    let mut send = std::pin::pin!(send);
+    let mut admitted = false;
+    std::future::poll_fn(|cx| {
+        if admitted {
+            return send.as_mut().poll(cx).map(Ok);
+        }
+        match permit.admit(origin, || send.as_mut().poll(cx)) {
+            Ok(poll) => {
+                admitted = true;
+                poll.map(Ok)
+            }
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    })
+    .await
+}
+
 /// What one cell event's outbound effects gate against.
 #[derive(Clone)]
 struct EgressFrame {
@@ -836,6 +968,8 @@ struct EgressFrame {
     storage: String,
     /// The committed-write position of `storage` when the event started.
     before: u64,
+    // captured at event entry, never borrowed from a successor connection.
+    epoch: Option<u64>,
     /// The root cell's gate, when `storage` names an embedded facet. Kept
     /// beside the scope it stores under, so an effect cannot take one without
     /// the other and charge a facet's egress to the facet.
@@ -890,7 +1024,7 @@ fn egress_gate_request(context: &IoContext, channel: celld_logic::Channel) -> Eg
     if let Some(root) = frame.root {
         return facet_egress_gate(&cell, root, channel);
     }
-    let epoch = storage::activation_epoch(&cell);
+    let epoch = frame.epoch;
     match sample.filter(|position| *position > before) {
         Some(position) => EgressGate::Wrote(cell, channel, position, epoch),
         // A read-only output in a process that configured no output gate has
@@ -1354,6 +1488,7 @@ fn abandon_context_input_gates(context: &IoContext) -> Vec<(String, celld_logic:
         // See `release_cell_gate`: releasing an origin can re-enter this map
         // from its eventual context destructor.
         drop(origin);
+        let _ = context.finish_native_gate(*event, abandoned);
         if abandoned {
             wake_gate_waiters(cell, Err(ABANDONED_INPUT_GATE.to_string()));
         }
@@ -2412,7 +2547,13 @@ fn admission_refusal_forced(_state: &HeapLimitState) -> bool {
 }
 
 type SerializedPut = (String, Vec<u8>);
-type PendingPuts = HashMap<String, Vec<SerializedPut>>;
+struct PendingPutBatch {
+    owner: Arc<crate::native_ws::PendingUpgrades>,
+    entries: Vec<SerializedPut>,
+}
+
+type PendingPuts = HashMap<String, PendingPutBatch>;
+type SqlCursorOwner = (String, Arc<crate::native_ws::PendingUpgrades>, String);
 
 /// One Fetcher route transferred from a Worker Loader parent into its child.
 /// The generation and the complete target travel together, so a loaded Worker
@@ -2436,9 +2577,15 @@ enum EgressPolicy {
 
 #[derive(Default)]
 struct ActorRuntimeState {
+    native_activations: Arc<crate::native_ws::ActivationUpgrades>,
+    allocation_brands: Mutex<HashMap<String, container::AllocationBrand>>,
+    native_cleanup:
+        Mutex<HashMap<String, crate::native_ws::UpgradeCleanup<crate::native_ws::NativeUpgrade>>>,
     promises: std::sync::Mutex<PromiseMap>,
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
+    storage_transactions: Mutex<HashMap<String, Arc<crate::native_ws::PendingUpgrades>>>,
+    sql_cursor_owners: Mutex<HashMap<u64, SqlCursorOwner>>,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
     /// WebSocket captures that received a frame in the current isolate turn.
     /// Weak references record every continuation context without extending
@@ -2520,6 +2667,24 @@ fn advance_io_time(scope: &mut v8::PinScope) -> i64 {
 }
 
 impl ActorRuntimeState {
+    fn reset_actor_generation(&self, cell: &str, generation: &str) -> bool {
+        if !self.native_activations.reset(cell, generation) {
+            return false;
+        }
+        self.discard_pending_generation(cell, generation);
+        true
+    }
+
+    fn discard_pending_generation(&self, cell: &str, generation: &str) {
+        let mut pending = self.pending_puts.lock().unwrap();
+        if pending
+            .get(cell)
+            .is_some_and(|batch| batch.owner.generation().key() == generation)
+        {
+            pending.remove(cell);
+        }
+    }
+
     fn io_context(&self, id: u64) -> Option<Arc<IoContext>> {
         let mut contexts = self.io_contexts.lock().unwrap();
         let context = contexts.get(&id)?.upgrade();
@@ -2762,6 +2927,9 @@ fn cpu_watchdog_for_context(scope: &mut v8::PinScope, context: &IoContext) -> Op
 }
 
 fn finish_terminated_actor_event(scope: &mut v8::PinScope, context: &IoContext) {
+    if let Some((cell, key)) = context.reset_native_actor() {
+        retire_native_generation_js(scope, &cell, &key);
+    }
     finish_retired_input_gate_context(scope, context);
 }
 
@@ -2770,6 +2938,16 @@ fn finish_retired_input_gate_context(scope: &mut v8::PinScope, context: &IoConte
     let _ = abandon_context_input_gates(context);
     let context_id = context.continuation_id().unwrap_or_default();
     retire_input_gate_js_context(scope, context_id);
+}
+
+fn retire_native_generation_js(scope: &mut v8::PinScope, cell: &str, key: &str) {
+    let Ok(function) = internal_function(scope, "__retireNativeGeneration") else {
+        return;
+    };
+    let cell = v8::String::new(scope, cell).unwrap();
+    let key = v8::String::new(scope, key).unwrap();
+    let receiver = v8::undefined(scope).into();
+    let _ = function.call(scope, receiver, &[cell.into(), key.into()]);
 }
 
 fn retire_input_gate_js_context(scope: &mut v8::PinScope, context_id: u64) {
@@ -5084,12 +5262,23 @@ fn start_cell_event<'s>(
 ) -> Begun {
     let runtime_state = actor_runtime_state(tc);
     let context = IoContext::tracked(&runtime_state);
+    context.bind_native_activation(&runtime_state, scope);
     if let Some(stream_id) = body_stream_id {
         context.own_body_stream(stream_id);
     }
     let guard = CurrentGuard::enter(context.clone());
     let previous_io_context = install_io_context(tc, &context);
     context.begin_cpu_turn();
+    let storage_ready = runtime_state
+        .native_activations
+        .admit(scope, &context.native_upgrades(), || {
+            storage_ops::retire_storage_generations(
+                &runtime_state,
+                scope,
+                Some(&context.native_upgrades()),
+            )
+        })
+        .and_then(|result| result);
     // Sampled before the handler runs so the output gate can tell a write
     // this event made from celld's own activation writes. The first sample of
     // an activation is also the baseline a read-only answer observes above.
@@ -5099,6 +5288,7 @@ fn start_cell_event<'s>(
     context.egress.lock().unwrap().push(EgressFrame {
         storage: scope.to_string(),
         before: writes_before.unwrap_or(0),
+        epoch: storage::activation_epoch(scope),
         // A facet event stores here and gates on the cell that owns the root
         // database. Read once, with the position, so no later effect can take
         // one without the other.
@@ -5109,6 +5299,7 @@ fn start_cell_event<'s>(
     }
     let event_started = Instant::now();
     let started = (|| {
+        storage_ready.map_err(anyhow::Error::msg)?;
         begin_event_context(tc)?;
         let ret = call(tc)?;
         match ret.try_cast::<v8::Promise>() {
@@ -5793,6 +5984,33 @@ fn settle_isolate_heap(isolate: &mut v8::Isolate) {
 }
 
 impl Worker {
+    #[cfg(all(test, not(celld_internal_tests)))]
+    pub(crate) fn native_handoff_post_verdict_fetch_for_test(
+        &self,
+        cell: &str,
+        _epoch: u64,
+        release: tokio::sync::oneshot::Receiver<()>,
+        sends: Arc<AtomicUsize>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'static {
+        let runtime = &self.inner.as_ref().expect("live worker").runtime_state;
+        let origin = ActorEffectOrigin {
+            activations: Arc::downgrade(&runtime.native_activations),
+            cell: cell.to_string(),
+            #[cfg(all(debug_assertions, unix))]
+            epoch: Some(_epoch),
+            owner: runtime.native_activations.owner(cell),
+        };
+        async move {
+            release
+                .await
+                .map_err(|_| "post-verdict test gate dropped".to_string())?;
+            admit_fetch(Some(&origin), &mut FetchGatePermit::default(), async move {
+                sends.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+        }
+    }
+
     /// Compile the worker module, wire the DO harness, and extract the entry
     /// `fetch`. `do_classes` come from the manifest; `bindings` maps a binding
     /// name to a DO class name (from wrangler metadata).
@@ -6729,6 +6947,13 @@ ops! { OP_NAMES, install_op_functions,
         "__ws_bind_target" => websocket::op_ws_bind_target,
         "__ws_next" => websocket::op_ws_next,
         "__ws_upgrade" => websocket::op_ws_upgrade,
+        "__ws_consume_native" => websocket::op_ws_consume_native,
+        "__ws_release_native" => websocket::op_ws_release_native,
+        "__ws_track_native" => websocket::op_ws_track_native,
+        "__ws_drop_native_handle" => websocket::op_ws_drop_native_handle,
+        "__ws_native_generation" => websocket::op_ws_native_generation,
+        "__ws_native_generation_live" => websocket::op_ws_native_generation_live,
+        "__ws_reset_native_actor" => websocket::op_ws_reset_native_actor,
         "__hr_create" => html_rewriter::op_hr_create,
         "__hr_write" => html_rewriter::op_hr_write,
         "__hr_end" => html_rewriter::op_hr_end,
@@ -6745,6 +6970,10 @@ ops! { OP_NAMES, install_op_functions,
         "__container_running" => container::op_container_running,
         "__container_address" => container::op_container_address,
         "__container_start" => container::op_container_start,
+        "__container_bind" => container::op_container_bind,
+        "__container_start_allocation" => container::op_container_start_allocation,
+        "__container_inspect_allocation" => container::op_container_inspect_allocation,
+        "__container_destroy_allocation" => container::op_container_destroy_allocation,
         "__container_monitor" => container::op_container_monitor,
         "__container_destroy" => container::op_container_destroy,
         "__container_signal" => container::op_container_signal,
@@ -6855,6 +7084,7 @@ ops! { OP_NAMES, install_op_functions,
         "__with_input_gate_context" => op_with_input_gate_context,
         "__gate_acquire" => op_gate_acquire,
         "__gate_wait" => op_gate_wait,
+        "__gate_is_open" => op_gate_is_open,
         "__gate_release" => op_gate_release,
         "__timer_cancel" => op_timer_cancel,
         "__crypto_operation" => crypto::op_crypto_operation,
@@ -7212,11 +7442,14 @@ fn op_svc_call_impl(
         reply: tx,
     };
     let stream_service = http_stream_service();
+    let native_upgrades = event_context(scope).native_upgrades();
     let id = asyncrt::enqueue(async move {
         let mut cancel_guard = cancel_guard;
         gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
+            Ok(Ok(response)) => {
+                encode_http_response(response, true, &stream_service, Some(&native_upgrades))
+            }
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("service dropped: {error}")),
         };
@@ -7850,7 +8083,7 @@ fn op_loader_fetch(
         // context. That context owns an unread body tail through its
         // waitUntil work.
         body_guard.disarm();
-        encode_http_response(response, false, &stream_service)
+        encode_http_response(response, false, &stream_service, None)
     });
     let response = promise_for(scope, async_id);
     if let Some(request_id) = cancel_id {
@@ -8494,6 +8727,7 @@ fn op_facet_fetch(
     let host = FacetHost::of(loader);
     let trace = current_trace_context(scope);
     let stream_service = http_stream_service();
+    let native_upgrades = event_context(scope).native_upgrades();
     let async_id = asyncrt::enqueue(async move {
         let facet = prepare_facet(
             host?,
@@ -8539,7 +8773,7 @@ fn op_facet_fetch(
                 };
                 facet.gate_response(socket).await?;
                 facet.attach_websocket(&response);
-                encode_http_response(response, true, &stream_service)
+                encode_http_response(response, true, &stream_service, Some(&native_upgrades))
             }
             Ok(Err(error)) => Err(format!("{error}")),
             Err(_) => match driving.await {
@@ -8779,10 +9013,13 @@ fn op_do_call_impl(
         parent: current_trace_context(scope),
     };
     let stream_service = http_stream_service();
+    let native_upgrades = event_context(scope).native_upgrades();
     let id = asyncrt::enqueue(async move {
         gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
+            Ok(Ok(response)) => {
+                encode_http_response(response, true, &stream_service, Some(&native_upgrades))
+            }
             Ok(Err(e)) => Err(format!("{e}")),
             Err(e) => Err(format!("proxy dropped: {e}")),
         };
@@ -8992,7 +9229,13 @@ fn op_fetch(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let context = event_context(scope);
+    let Some(context) = current_reaction_or_untracked_io_context(scope) else {
+        return loader_throw(scope, RETIRED_EFFECT);
+    };
+    let origin = match ActorEffectOrigin::capture(scope, &context) {
+        Ok(origin) => origin,
+        Err(error) => return loader_throw(scope, &error),
+    };
     if let Err(error) = context.charge_subrequest() {
         return loader_throw(scope, &error);
     }
@@ -9047,7 +9290,7 @@ fn op_fetch(
     // request it asked for.
     let cancellable = args.get(6).boolean_value(scope);
     let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
-        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+        Some(stream_id) => match context.transfer_body_stream(stream_id) {
             Some(guard) => guard,
             None => return loader_throw(scope, "fetch: the body stream is not owned"),
         },
@@ -9077,7 +9320,12 @@ fn op_fetch(
             (None, None, None)
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Fetch);
+        let gate = match admit_actor_effect(origin.as_ref(), || {
+            egress_gate_request(&context, celld_logic::Channel::Fetch)
+        }) {
+            Ok(gate) => gate,
+            Err(error) => return loader_throw(scope, &error),
+        };
         let request = SvcCallReq {
             cancel,
             generation: broker.generation,
@@ -9091,11 +9339,21 @@ fn op_fetch(
             reply: tx,
         };
         let stream_service = http_stream_service();
+        let native_upgrades = context.native_upgrades();
         let id = asyncrt::enqueue(async move {
             let mut cancel_guard = cancel_guard;
-            gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
+            let mut permit = await_fetch_gate(gate, origin.as_ref()).await?;
+            permit.admit(origin.as_ref(), || {
+                SVC_CALL_TX
+                    .get()
+                    .ok_or_else(|| "no service binding channel".to_string())?
+                    .send(request)
+                    .map_err(|_| "service binding channel closed".to_string())
+            })??;
             let result = match rx.await {
-                Ok(Ok(response)) => encode_http_response(response, true, &stream_service),
+                Ok(Ok(response)) => {
+                    encode_http_response(response, true, &stream_service, Some(&native_upgrades))
+                }
                 Ok(Err(error)) => Err(format!("{error}")),
                 Err(error) => Err(format!("globalOutbound Fetcher dropped: {error}")),
             };
@@ -9142,7 +9400,12 @@ fn op_fetch(
     // third party that has acted on a write celld then loses cannot be told to
     // un-act. That covers a write this handler made and a value it only read,
     // because the third party cannot tell the two apart.
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Fetch);
+    let gate = match admit_actor_effect(origin.as_ref(), || {
+        egress_gate_request(&context, celld_logic::Channel::Fetch)
+    }) {
+        Ok(gate) => gate,
+        Err(error) => return loader_throw(scope, &error),
+    };
     // Shares the cancel registry, the id encoding and the `__do_call_cancel`
     // op that a Durable Object call and a service binding call already use.
     // Only a caller that supplied an AbortSignal registers: without one there
@@ -9188,9 +9451,11 @@ fn op_fetch(
                 crate::telemetry::record(span);
             }
         };
-        await_egress_gate(gate).await.inspect_err(|error| {
-            finish(false, None, Some(error.clone()));
-        })?;
+        let mut permit = await_fetch_gate(gate, origin.as_ref())
+            .await
+            .inspect_err(|error| {
+                finish(false, None, Some(error.clone()));
+            })?;
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         // a timeout bounds a black-hole host: the future settles (Err) instead
         // of parking run_loop forever — the hang the Drop guard can't catch.
@@ -9238,15 +9503,18 @@ fn op_fetch(
                 "a cancel that is ready wins a tie, so an aborted request never \
                  hands back a response and never leaves a body stream nobody reads";
                 _ = cancel => None,
-                result = rb.send() => Some(result),
+                result = admit_fetch(origin.as_ref(), &mut permit, async move { rb.send().await }) => Some(result),
             },
-            None => Some(rb.send().await),
+            None => Some(
+                admit_fetch(origin.as_ref(), &mut permit, async move { rb.send().await }).await,
+            ),
         };
         let Some(sent) = sent else {
             let error = "fetch: the request was aborted".to_string();
             finish(false, None, Some(error.clone()));
             return Err(error);
         };
+        let sent = sent.inspect_err(|error| finish(false, None, Some(error.clone())))?;
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -9327,7 +9595,7 @@ fn op_asset_fetch(
             return Err("no asset resolver channel".to_string());
         }
         match rx.await {
-            Ok(Ok(response)) => encode_http_response(response, false, &stream_service),
+            Ok(Ok(response)) => encode_http_response(response, false, &stream_service, None),
             Ok(Err(error)) => Err(format!("asset fetch: {error}")),
             Err(error) => Err(format!("asset resolver dropped: {error}")),
         }
@@ -9588,14 +9856,37 @@ fn op_gate_acquire(
     // The harness installs the driver before acquisition. A missing driver
     // is rejected above instead of transferring a stale block to its origin.
     let owner = owner_context.continuation_id();
+    let native_key = args.get(1).to_rust_string_lossy(scope);
+    if !args.get(1).is_null_or_undefined() {
+        if !actor_runtime_state(scope)
+            .native_activations
+            .matches(&cell, &native_key)
+        {
+            let promise = rejected_promise(scope, RETIRED_INPUT_GATE);
+            return_gate_acquisition(scope, rv, event, None, promise);
+            return;
+        }
+        owner_context
+            .native_gate_generations
+            .lock()
+            .unwrap()
+            .insert(event, (cell.clone(), native_key));
+    }
     // Queued until taken or refused, either way once: the guard counts the
     // event out when the future ends, however it ends.
     struct Queued {
         cell: String,
         owner: Option<u64>,
+        context: Weak<IoContext>,
+        event: celld_logic::gate::EventId,
     }
     impl Queued {
-        fn new(cell: String, owner: Option<u64>) -> Self {
+        fn new(
+            cell: String,
+            owner: Option<u64>,
+            context: &Arc<IoContext>,
+            event: celld_logic::gate::EventId,
+        ) -> Self {
             if let Some(owner) = owner {
                 *cell_gates()
                     .lock()
@@ -9607,11 +9898,27 @@ fn op_gate_acquire(
                     .or_default() += 1;
                 GATE_ENGAGEMENTS.fetch_add(1, Ordering::Relaxed);
             }
-            Self { cell, owner }
+            Self {
+                cell,
+                owner,
+                context: Arc::downgrade(context),
+                event,
+            }
         }
     }
     impl Drop for Queued {
         fn drop(&mut self) {
+            if let Some(context) = self.context.upgrade() {
+                let held = context
+                    .input_gates
+                    .lock()
+                    .unwrap()
+                    .held
+                    .contains_key(&self.event);
+                if !held {
+                    let _ = context.finish_native_gate(self.event, false);
+                }
+            }
             let Some(owner) = self.owner else {
                 return;
             };
@@ -9638,6 +9945,7 @@ fn op_gate_acquire(
         None
     } else {
         let Some(claim) = context.claim_cross_entry_gate() else {
+            let _ = owner_context.finish_native_gate(event, false);
             let promise = rejected_promise(scope, RETIRED_INPUT_GATE);
             return_gate_acquisition(scope, rv, event, None, promise);
             return;
@@ -9652,7 +9960,7 @@ fn op_gate_acquire(
             mut gate,
             mut retirement,
         } => {
-            let queued = Queued::new(cell.clone(), owner);
+            let queued = Queued::new(cell.clone(), owner, &owner_context, event);
             let context = Arc::downgrade(&owner_context);
             asyncrt::enqueue_io_context(async move {
                 let _queued = queued;
@@ -9698,6 +10006,7 @@ fn op_gate_acquire(
             })
         }
         CellGateAcquisition::Retired => {
+            let _ = owner_context.finish_native_gate(event, false);
             let promise = rejected_promise(scope, RETIRED_INPUT_GATE);
             return_gate_acquisition(scope, rv, event, None, promise);
             return;
@@ -9718,27 +10027,77 @@ fn op_gate_acquire(
 /// Rejecting matters as much as resolving: a critical section that failed
 /// reset the cell, so what waited behind it is refused with the reason
 /// rather than run against state that no longer exists.
+async fn wait_for_cell_input_gate(
+    cell: &str,
+    generation: Option<crate::native_ws::NativeOwner>,
+) -> Result<String, String> {
+    let revoked = generation
+        .as_ref()
+        .map(|owner| owner.revocation())
+        .unwrap_or_default();
+    loop {
+        if revoked.is_cancelled() {
+            return Err(RETIRED_INPUT_GATE.to_string());
+        }
+        let Some(open) = cell_gate_wait(cell) else {
+            return Ok(String::new());
+        };
+        let result = asyncrt::select_biased! {
+            "a retired generation cannot receive a callback after its input gate opens";
+            _ = revoked.cancelled() => return Err(RETIRED_INPUT_GATE.to_string()),
+            result = open => result,
+        };
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => return Err(failure),
+            Err(_) => return Err("cell stopped while waiting for its input gate".to_string()),
+        }
+    }
+}
+
 fn op_gate_wait(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    let id = asyncrt::enqueue(async move {
-        loop {
-            match cell_gate_wait(&cell) {
-                None => return Ok(String::new()),
-                Some(open) => match open.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(failure)) => return Err(failure),
-                    Err(_) => {
-                        return Err("cell stopped while waiting for its input gate".to_string())
-                    }
-                },
-            }
+    let generation = if args.get(1).is_null_or_undefined() {
+        None
+    } else {
+        let key = args.get(1).to_rust_string_lossy(scope);
+        let table = event_context(scope).native_upgrades();
+        let runtime = actor_runtime_state(scope);
+        if !runtime.native_activations.authorises(&cell, &table)
+            || !runtime.native_activations.matches(&cell, &key)
+        {
+            rv.set(rejected_promise(scope, RETIRED_INPUT_GATE));
+            return;
         }
-    });
+        Some(table.generation())
+    };
+    let retained = generation.is_some();
+    let waiting = async move { wait_for_cell_input_gate(&cell, generation).await };
+    let id = if retained {
+        asyncrt::enqueue_io_context(waiting)
+    } else {
+        asyncrt::enqueue(waiting)
+    };
     rv.set(promise_for(scope, id));
+}
+
+fn op_gate_is_open(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    rv.set_bool(
+        cell_gates()
+            .lock()
+            .unwrap()
+            .get(&cell)
+            .is_none_or(|gate| gate.gate.is_open()),
+    );
 }
 
 /// `__gate_release(scope, event, owner)` — the block is over. The next
@@ -9773,7 +10132,11 @@ fn op_gate_release(
         return;
     };
     if !context.release_input_gate(&cell, event) {
+        let _ = context.finish_native_gate(event, false);
         return;
+    }
+    if let Some((cell, key)) = context.finish_native_gate(event, outcome.is_err()) {
+        retire_native_generation_js(scope, &cell, &key);
     }
     release_cell_gate(&cell, event, outcome);
 }
@@ -9971,12 +10334,17 @@ fn op_actor_abort(
     };
     let cell = args.get(0).to_rust_string_lossy(scope);
     let reason = args.get(1).to_rust_string_lossy(scope);
+    let generation = args.get(2).to_rust_string_lossy(scope);
     let state = actor_runtime_state(scope);
-    state
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .remove(&cell);
+    // the abort belongs to the state that requested it, not whichever event
+    // is executing an old state's method. reject before changing any actor data.
+    if !state
+        .native_activations
+        .authorises(&cell, &context.native_upgrades())
+        || !state.reset_actor_generation(&cell, &generation)
+    {
+        return;
+    }
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
         error: format!("__CELLD_ACTOR_ABORT__:{reason}"),
         actor_scope: Some(cell),
@@ -10009,11 +10377,16 @@ fn op_process_exit(
     let actor_scope = (!actor_scope.is_empty()).then_some(actor_scope);
     let state = actor_runtime_state(scope);
     if let Some(actor_scope) = actor_scope.as_deref() {
-        state
-            .pending_puts
-            .lock()
-            .expect("pending puts lock poisoned")
-            .remove(actor_scope);
+        let owner = context.native_upgrades();
+        if state
+            .native_activations
+            .admit(actor_scope, &owner, || {
+                state.discard_pending_generation(actor_scope, owner.generation().key());
+            })
+            .is_err()
+        {
+            return;
+        }
     }
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
         error: format!("__CELLD_PROCESS_EXIT__:The Node.js process.exit({code}) API was called."),
@@ -10945,6 +11318,12 @@ pub struct IoContext {
     /// a service-binding dispatch or a Durable Object call gets a context of
     /// its own rather than a frame inside this one.
     sockets: Mutex<Vec<u64>>,
+    // pending native upgrades cannot outlive this request or enter another
+    // context except through an owned host response.
+    native_upgrades: Arc<crate::native_ws::PendingUpgrades>,
+    native_actor_upgrades: OnceLock<Arc<crate::native_ws::PendingUpgrades>>,
+    native_gate_generations: Mutex<HashMap<celld_logic::gate::EventId, (String, String)>>,
+    native_socket_cancels: Mutex<Vec<tokio_util::sync::CancellationToken>>,
     /// HTMLRewriter instances this request created. Each holds a parked
     /// parser thread; freeing them at retirement is what reclaims the
     /// thread when a transform is abandoned unread — nothing else can,
@@ -11180,10 +11559,14 @@ impl IoContext {
     fn with_options(limits: Option<ResourceLimits>, tail_reporting: bool) -> Arc<Self> {
         Arc::new(Self {
             continuation: None,
+            native_gate_generations: Mutex::new(HashMap::new()),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
             sockets: Mutex::new(Vec::new()),
+            native_upgrades: Arc::new(crate::native_ws::PendingUpgrades::default()),
+            native_actor_upgrades: OnceLock::new(),
+            native_socket_cancels: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             input_gates: Mutex::new(InputGateClaims::default()),
@@ -11212,10 +11595,14 @@ impl IoContext {
         let id = allocate_io_context_id();
         let context = Arc::new(Self {
             continuation: Some((id, Arc::downgrade(runtime_state))),
+            native_gate_generations: Mutex::new(HashMap::new()),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
             sockets: Mutex::new(Vec::new()),
+            native_upgrades: Arc::new(crate::native_ws::PendingUpgrades::default()),
+            native_actor_upgrades: OnceLock::new(),
+            native_socket_cancels: Mutex::new(Vec::new()),
             rewriters: Mutex::new(Vec::new()),
             tcp_sockets: Mutex::new(Vec::new()),
             input_gates: Mutex::new(InputGateClaims::default()),
@@ -11353,7 +11740,7 @@ impl IoContext {
 
     fn release_input_gate(&self, cell: &str, event: celld_logic::gate::EventId) -> bool {
         let mut claims = self.input_gates.lock().unwrap();
-        if !claims.held.get(&event).is_some_and(|owned| owned == cell) {
+        if claims.held.get(&event).is_none_or(|owned| owned != cell) {
             return false;
         }
         claims.held.remove(&event);
@@ -11464,11 +11851,54 @@ impl IoContext {
         self.events.lock().unwrap().frames.len()
     }
 
-    /// Close every isolate-polled socket this request opened.
-    ///
-    /// Draining makes the operation idempotent. The drive loop calls it when
-    /// the request retires, and `drop` covers every earlier failure path.
+    fn reset_native_actor(&self) -> Option<(String, String)> {
+        let (_, runtime) = self.continuation.as_ref()?;
+        let runtime = runtime.upgrade()?;
+        let reset = runtime
+            .native_activations
+            .reset_bound(self.native_actor_upgrades.get()?)?;
+        runtime.discard_pending_generation(&reset.0, &reset.1);
+        Some(reset)
+    }
+
+    fn finish_native_gate(
+        &self,
+        event: celld_logic::gate::EventId,
+        failed: bool,
+    ) -> Option<(String, String)> {
+        let generation = self.native_gate_generations.lock().unwrap().remove(&event);
+        if !failed {
+            return None;
+        }
+        let (cell, key) = generation?;
+        let (_, runtime) = self.continuation.as_ref()?;
+        runtime
+            .upgrade()?
+            .reset_actor_generation(&cell, &key)
+            .then_some((cell, key))
+    }
+
+    fn bind_native_activation(&self, runtime: &ActorRuntimeState, scope: &str) {
+        assert!(self
+            .native_actor_upgrades
+            .set(runtime.native_activations.owner(scope))
+            .is_ok());
+    }
+
+    fn native_upgrades(&self) -> Arc<crate::native_ws::PendingUpgrades> {
+        self.native_actor_upgrades
+            .get()
+            .unwrap_or(&self.native_upgrades)
+            .clone()
+    }
+
+    // request retirement must not revoke an actor's retained upgrade promise.
+    // activation release closes the actor table, including stale continuations.
     fn close_sockets(&self) {
+        self.native_upgrades.close();
+        for cancel in self.native_socket_cancels.lock().unwrap().drain(..) {
+            cancel.cancel();
+        }
         let opened = self.sockets.lock().unwrap().drain(..).collect();
         ws_close_request_sockets(opened);
         let rewriters: Vec<u64> = self.rewriters.lock().unwrap().drain(..).collect();
@@ -12098,13 +12528,18 @@ fn op_alarm_set(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let s = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_ops::storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let s = &origin.cell;
     let at = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
     let timing_started = (tracing::enabled!(target: "queue_timing", tracing::Level::DEBUG)
         && s.split_once(':')
             .is_some_and(|(class, _)| class == crate::deploy::QUEUE_CLASS))
     .then(crate::asyncrt::mono_us);
-    let result = storage::set_alarm(&s, at);
+    let result = origin
+        .admit(|| storage::set_alarm(s, at).map_err(|error| error.to_string()))
+        .and_then(|result| result);
     if let Some(timing_started) = timing_started {
         tracing::debug!(
             target: "queue_timing",
@@ -12120,7 +12555,7 @@ fn op_alarm_set(
         // current event's output gate. Inside an explicit transaction (`Ok(None)`)
         // the gate registers at that transaction's commit instead.
         Ok(Some(committed)) if committed >= 0 => {
-            spawn_arm_gate(&s, committed, current_reaction_io_context(scope))
+            spawn_arm_gate(s, committed, current_reaction_io_context(scope))
         }
         Ok(_) => {}
     }
@@ -12137,9 +12572,15 @@ fn op_queue_alarm_set_wait(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_ops::storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let cell = &origin.cell;
     let at_ms = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
-    let committed = match storage::set_alarm(&cell, at_ms) {
+    let committed = match origin
+        .admit(|| storage::set_alarm(cell, at_ms).map_err(|error| error.to_string()))
+        .and_then(|result| result)
+    {
         Ok(committed) => committed,
         Err(error) => {
             throw_storage_error(scope, "Queue setAlarm", error);
@@ -12149,7 +12590,7 @@ fn op_queue_alarm_set_wait(
     let Some(committed) = committed.filter(|committed| *committed >= 0) else {
         return;
     };
-    let Some(gate) = launch_arm_gate(&cell, observe_alarm(&cell, Some(committed))) else {
+    let Some(gate) = launch_arm_gate(cell, observe_alarm(cell, Some(committed))) else {
         return;
     };
     let id = asyncrt::enqueue(async move {
@@ -12177,8 +12618,13 @@ fn op_alarm_delete(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let s = args.get(0).to_rust_string_lossy(scope);
-    if let Err(error) = storage::delete_alarm(&s) {
+    let Some(origin) = storage_ops::storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    if let Err(error) = origin
+        .admit(|| storage::delete_alarm(&origin.cell).map_err(|error| error.to_string()))
+        .and_then(|result| result)
+    {
         throw_storage_error(scope, "deleteAlarm", error);
     }
 }
@@ -12655,11 +13101,29 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
     if status == 101 {
         tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
     }
-    let websocket = match (ws, worker_ws) {
-        (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),
-        (None, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
-        (None, None) => None,
-        (Some(_), Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
+    let native_key = v8::String::new(scope, "nativeSocketId").unwrap();
+    let native_id = out
+        .get(scope, native_key.into())
+        .and_then(|value| value.integer_value(scope))
+        .unwrap_or(0)
+        .max(0) as u64;
+    let native = if native_id == 0 {
+        None
+    } else {
+        Some(current_context().native_upgrades().take(native_id)?)
+    };
+    let websocket = match (ws, worker_ws, native) {
+        (Some(target), None, None) => Some(HttpResponseWebSocket::Cell(target)),
+        (None, Some(worker), None) => Some(HttpResponseWebSocket::Worker(worker)),
+        (None, None, Some(connection)) if status == 101 => {
+            Some(HttpResponseWebSocket::Native(Box::new(connection)))
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "response has conflicting or invalid WebSocket targets"
+            ))
+        }
     };
     Ok(HttpResponse {
         status,
@@ -12680,3 +13144,7 @@ pub fn init_engine_for_tests() {
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+
+#[cfg(all(test, not(celld_internal_tests)))]
+#[path = "js/native_ws_lifetime_tests.rs"]
+mod native_ws_lifetime_tests;

@@ -73,6 +73,8 @@ impl std::fmt::Display for Error {
     }
 }
 
+pub const MAX_DECLINED_BODY_BYTES: usize = 1024 * 1024;
+
 pub struct Connection {
     pub socket: WebSocket<TokioIo<Upgraded>>,
     /// The 101's headers: the negotiated subprotocol, and on the peer hop the
@@ -160,15 +162,19 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
         .body(Empty::<bytes::Bytes>::new())
         .context("build WebSocket handshake")?;
     request.headers_mut().extend(extra);
+    // this transport implements no extensions, including permessage-deflate.
+    request
+        .headers_mut()
+        .remove(hyper::header::SEC_WEBSOCKET_EXTENSIONS);
 
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .with_context(|| format!("HTTP handshake with {authority}"))?;
-    // The upgrade is completed by polling this, so it has to outlive the
-    // response -- and keep running afterwards to drive the upgraded stream.
-    tokio::spawn(async move {
+    // the handshake owns its driver until hyper transfers the stream into
+    // upgraded. cancelling before that transfer must also stop the driver.
+    let _driver = HandshakeDriver(tokio::spawn(async move {
         let _ = connection.with_upgrades().await;
-    });
+    }));
 
     let mut response = sender
         .send_request(request)
@@ -177,12 +183,12 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response
-            .into_body()
+        let body = http_body_util::Limited::new(response.into_body(), MAX_DECLINED_BODY_BYTES)
             .collect()
             .await
-            .map(|body| body.to_bytes().to_vec())
-            .unwrap_or_default();
+            .map_err(|error| anyhow!("read declined WebSocket response: {error}"))?
+            .to_bytes()
+            .to_vec();
         return Err(Error::Declined(Box::new(Declined {
             status,
             headers,
@@ -198,6 +204,12 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
         return Err(anyhow!("server returned an invalid Sec-WebSocket-Accept").into());
     }
 
+    if response
+        .headers()
+        .contains_key(hyper::header::SEC_WEBSOCKET_EXTENSIONS)
+    {
+        return Err(anyhow!("server negotiated unsupported WebSocket extensions").into());
+    }
     let headers = response.headers().clone();
     let upgraded = hyper::upgrade::on(&mut response)
         .await
@@ -206,6 +218,14 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
         socket: WebSocket::after_handshake(TokioIo::new(upgraded), Role::Client),
         headers,
     })
+}
+
+struct HandshakeDriver(tokio::task::JoinHandle<()>);
+
+impl Drop for HandshakeDriver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}

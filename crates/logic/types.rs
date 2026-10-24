@@ -320,6 +320,8 @@ pub enum HaltReason {
 pub enum CasOutcome {
     Applied,
     Rejected,
+    // admission refused before a cas was sent, not a conflicting or unknown write.
+    CooperativeRetirementRequired,
 }
 
 /// Observable result of a successful restore effect. A non-fresh activation
@@ -915,6 +917,7 @@ pub enum RequestError {
     NodeUnavailable,
     ResolveFailed,
     AcquireFailed,
+    CooperativeRetirementRequired,
     RestoreFailed,
     RuntimeFailed,
     PublishFailed,
@@ -1281,6 +1284,9 @@ pub struct LocalCell {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopCause {
     Cleanup,
+    /// Retire failed-start replicas and facets before bounded owner release.
+    /// This stop cannot expire or be abandoned for demand.
+    DormantRelease,
     /// `rebalance` means this eviction hands the cell to the fleet: its
     /// ownership record is released and the local replica is not worth
     /// keeping. An idle eviction is the opposite on both counts -- it

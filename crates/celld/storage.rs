@@ -3228,6 +3228,41 @@ pub fn d1_run_json(scope: &str, request: &str) -> String {
     }
 }
 
+// only the host's exact-generation transaction cleanup calls this. unlike
+// ordinary rollback, an existing critical error must not turn it into a no-op.
+pub(crate) fn rollback_retired_transaction(scope: &str) -> Result<(), String> {
+    let result = with(scope, |connection| {
+        without_sql_authorizer(connection, || {
+            if !connection.is_autocommit() {
+                connection
+                    .execute_batch("ROLLBACK")
+                    .map_err(|error| error.to_string())?;
+            }
+            if !connection.is_autocommit() {
+                return Err("retired storage transaction remains open".to_string());
+            }
+            Ok(())
+        })
+    })
+    .unwrap_or_else(|| Err(format!("no db for {scope}")));
+    match result {
+        Ok(()) => {
+            publish_alarm_if_transaction_dirty(scope);
+            Ok(())
+        }
+        Err(error) => {
+            let error = format!("retired storage transaction cleanup failed: {error}");
+            sql_critical_errors(|errors| {
+                errors
+                    .borrow_mut()
+                    .entry(scope.to_string())
+                    .or_insert_with(|| error.clone());
+            });
+            Err(error)
+        }
+    }
+}
+
 /// `Ok(Some(at_ms))` when an outermost commit published a dirty committed
 /// alarm: the caller performs the arm-time wake-entry gate before acking the
 /// transaction. Rollbacks restore previously committed (already covered)

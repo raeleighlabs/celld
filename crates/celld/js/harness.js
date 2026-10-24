@@ -287,7 +287,9 @@ globalThis.Response = class Response {
     this.headers = new Headers(init.headers);
     if (typed && typed.type && !this.headers.has("content-type"))
       this.headers.set("content-type", typed.type);
-    this.webSocket = init.webSocket ?? null;
+    this.webSocket = init.webSocket ?? (init.__nativeUpgrade
+      ? __makeNativeSocket(init.__nativeUpgrade, this.headers.get("sec-websocket-protocol") || "")
+      : null);
     this._wsTarget = init.__wsTarget || init._wsTarget || null;
     this.ok = this.status >= 200 && this.status <= 299;
     this.redirected = false;
@@ -716,16 +718,19 @@ globalThis.fetch = async (input, init) => {
 const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
   async (req) => {
   const scope = __currentActorScope();
+  const signal = req._signalForSubrequests;
+  if (signal?.aborted) throw signal.reason;
+  __captureNativeGeneration(scope);
   const id = __ws_alloc();
   const socket = __makeSocket(id);
+  socket._nativeUpgrade = id;
   socket._outbound = true;
   socket._polled = !scope;
   socket.url = req.url;
   socket.readyState = WebSocket.READY_STATE_CONNECTING;
-  __sockets.set(id, socket);
   let raw;
   try {
-    raw = JSON.parse(await __ws_upgrade(
+    const opening = __ws_upgrade(
       id,
       scope,
       req.url,
@@ -738,8 +743,12 @@ const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
       // what the peer must see. Moving this to the header list needs the
       // host to append instead, so it is a separate change.
       JSON.stringify(Array.from(req.headers)),
-    ));
+    );
+    raw = JSON.parse(await (signal
+      ? __raceCallerAbort(opening, signal, () => __ws_release_native(id))
+      : opening));
   } catch (error) {
+    __ws_release_native(id);
     __sockets.delete(id);
     throw error;
   }
@@ -755,7 +764,12 @@ const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
     return response;
   }
   socket.protocol = raw.protocol ?? "";
-  const response = new Response(null, { status: 101 });
+  socket.readyState = WebSocket.READY_STATE_OPEN;
+  __trackNativeSocket(socket);
+  const response = new Response(null, {
+    status: 101,
+    headers: socket.protocol ? { "Sec-WebSocket-Protocol": socket.protocol } : {},
+  });
   response.webSocket = socket;
   response.url = req.url;
   return response;
@@ -1279,8 +1293,15 @@ globalThis.setInterval = (cb, ms, ...a) => {
 globalThis.clearTimeout = __clearTimer;
 globalThis.clearInterval = __clearTimer;
 
+const __storageReceivers = new WeakMap();
+const __storageReceiver = (storage) => {
+  const receiver = __storageReceivers.get(storage);
+  if (receiver === undefined) throw new TypeError("storage receiver or activation is invalid");
+  return receiver;
+};
+const __sqlCursorReceivers = new WeakMap();
 const __sqlCursorFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry((cursorId) => __sql_cursor_close(cursorId))
+  ? new FinalizationRegistry(({ cursorId, receiver }) => __sql_cursor_close(cursorId, receiver))
   : null;
 
 // A `SqlStorageCursor` over one exec's result (Cloudflare DO SQL API).
@@ -1288,7 +1309,8 @@ class SqlCursor {
   // `res` is what `__sql_cursor_start` returns: V8 values throughout, with the
   // first row already stepped. A failing query throws out of the op, so there
   // is no in-band error field to test here.
-  constructor(res) {
+  constructor(res, receiver) {
+    __sqlCursorReceivers.set(this, receiver);
     this.columns = res.columns;
     this.rowsWritten = Number(res.rowsWritten || 0);
     this.reusedCachedQueryForTest = Boolean(res.reusedCachedQuery);
@@ -1300,7 +1322,7 @@ class SqlCursor {
     if (this._cursorId && __sqlCursorFinalizer) {
       this._finalizerToken = {};
       __sqlCursorFinalizer.register(
-        this, this._cursorId, this._finalizerToken,
+        this, { cursorId: this._cursorId, receiver }, this._finalizerToken,
       );
     }
   }
@@ -1322,7 +1344,7 @@ class SqlCursor {
     // row -- the error belongs to the call after it, not to this one.
     let result;
     try {
-      result = __sql_cursor_next(this._cursorId);
+      result = __sql_cursor_next(this._cursorId, __sqlCursorReceivers.get(this));
     } catch (error) {
       this._deferredError = error;
       this._prefetched = null;
@@ -1430,13 +1452,14 @@ class SqlStorage {
       }
     }
     const json = JSON.stringify(jsonBinds);
+    const receiver = __storageReceiver(this._storage);
     return new SqlCursor(byteBinds.length === 0
-      ? __sql_cursor_start(this._scope, query, json)
-      : __sql_cursor_start(this._scope, query, json, byteBinds));
+      ? __sql_cursor_start(receiver, query, json)
+      : __sql_cursor_start(receiver, query, json, byteBinds), receiver);
   }
   ingest(input) {
     this._storage._assertTransactionActive("sql.ingest");
-    const result = JSON.parse(__sql_ingest(this._scope, String(input)));
+    const result = JSON.parse(__sql_ingest(__storageReceiver(this._storage), String(input)));
     if (result.error) throw new Error("SQL error: " + result.error);
     return result;
   }
@@ -1526,15 +1549,15 @@ class SyncKvStorage {
     this._storage._assertTransactionActive("kv.put");
     key = String(key);
     try {
-      __storage_put(this._storage._scope, key, value);
+      __storage_put(__storageReceiver(this._storage), key, value);
     } catch (error) {
-      __storage_put_serialized(this._storage._scope, key,
+      __storage_put_serialized(__storageReceiver(this._storage), key,
                                __storedBytes(value, error));
     }
   }
   delete(key) {
     this._storage._assertTransactionActive("kv.delete");
-    return __storage_delete(this._storage._scope, String(key));
+    return __storage_delete(__storageReceiver(this._storage), String(key));
   }
   list(options = {}) {
     this._storage._assertTransactionActive("kv.list");
@@ -1555,6 +1578,9 @@ class DurableObjectStorage {
     transactionDepth = 0,
     transactionControl = null,
   ) {
+    __storageReceivers.set(this, transactionRoot
+      ? __storageReceiver(transactionRoot)
+      : __container_bind(scope, true));
     this._scope = scope;
     this._state = state;
     this.sql = new SqlStorage(scope, state, this);
@@ -1595,7 +1621,7 @@ class DurableObjectStorage {
     // transaction. Its promise completes without flushing a later scope.
     if (this._transactionStatus()) return false;
     if (this._state && this._state._aborted) return false;
-    __storage_flush_pending_puts(this._scope);
+    __storage_flush_pending_puts(__storageReceiver(this));
     return true;
   }
   async get(k) {
@@ -1616,9 +1642,9 @@ class DurableObjectStorage {
     this._assertTransactionActive("put");
     if (typeof k === "string") {
       try {
-        __storage_queue_put(this._scope, k, val);
+        __storage_queue_put(__storageReceiver(this), k, val);
       } catch (error) {
-        __storage_queue_put_serialized(this._scope, k,
+        __storage_queue_put_serialized(__storageReceiver(this), k,
                                        __storedBytes(val, error));
       }
       await Promise.resolve();
@@ -1630,7 +1656,7 @@ class DurableObjectStorage {
     const entries =
       source.map(([key, value]) => [String(key), value]);
     try {
-      __storage_queue_put_many(this._scope, entries);
+      __storage_queue_put_many(__storageReceiver(this), entries);
     } catch (error) {
       // A batch with a stub entry: encode every entry first (plain
       // entries keep their native clone bytes, stub entries take
@@ -1645,7 +1671,7 @@ class DurableObjectStorage {
         }
       });
       for (const [key, bytes] of encoded)
-        __storage_queue_put_serialized(this._scope, key, bytes);
+        __storage_queue_put_serialized(__storageReceiver(this), key, bytes);
     }
     await Promise.resolve();
     this._flushPendingPuts();
@@ -1656,9 +1682,9 @@ class DurableObjectStorage {
     if (!this._flushPendingPuts()) return;
     if (Array.isArray(k)) {
       if (k.length === 0) return 0;
-      return __storage_delete_many(this._scope, k);
+      return __storage_delete_many(__storageReceiver(this), k);
     }
-    return __storage_delete(this._scope, k);
+    return __storage_delete(__storageReceiver(this), k);
   }
   async list(options = {}) {
     this._assertTransactionActive("list");
@@ -1671,7 +1697,7 @@ class DurableObjectStorage {
     this._assertTransactionActive("deleteAll");
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return;
-    __storage_delete_all(this._scope, __cell.deleteAllDeletesAlarm);
+    __storage_delete_all(__storageReceiver(this), __cell.deleteAllDeletesAlarm);
   }
   // Resolves once every write this cell committed before the call is
   // proven durable, by the proof the output gate requires before it releases
@@ -1691,7 +1717,7 @@ class DurableObjectStorage {
       throw new Error(
         "storage.sync: " + this._scope + " was aborted; the object is no " +
         "longer running");
-    await __storage_sync(this._scope);
+    await __storage_sync(__storageReceiver(this));
   }
   async setAlarm(t) {
     this._assertTransactionActive("setAlarm");
@@ -1699,7 +1725,7 @@ class DurableObjectStorage {
     if (!this._flushPendingPuts()) return;
     if (this._state?._facetDepth > 0)
       throw new Error("Facets currently cannot set alarms.");
-    __alarm_set(this._scope, t instanceof Date ? t.getTime() : Number(t));
+    __alarm_set(__storageReceiver(this), t instanceof Date ? t.getTime() : Number(t));
   }
   async getAlarm() {
     this._assertTransactionActive("getAlarm");
@@ -1712,24 +1738,24 @@ class DurableObjectStorage {
     this._assertTransactionActive("deleteAlarm");
     if (!this._transactionControl) await Promise.resolve();
     if (!this._flushPendingPuts()) return;
-    __alarm_delete(this._scope);
+    __alarm_delete(__storageReceiver(this));
   }
   _transactionStart() {
     const root = this._transactionRoot;
     const savepoint = "cells_tx_" + (++root._transactionSerial);
     __storage_transaction_control(
-      this._scope, "start", this._transactionDepth > 0, savepoint,
+      __storageReceiver(this), "start", this._transactionDepth > 0, savepoint,
     );
     return savepoint;
   }
   _transactionCommit(savepoint) {
     __storage_transaction_control(
-      this._scope, "commit", this._transactionDepth > 0, savepoint,
+      __storageReceiver(this), "commit", this._transactionDepth > 0, savepoint,
     );
   }
   _transactionRollback(savepoint, explicit = false) {
     __storage_transaction_control(
-      this._scope,
+      __storageReceiver(this),
       explicit ? "rollback_explicit" : "rollback",
       this._transactionDepth > 0,
       savepoint,
@@ -2222,6 +2248,7 @@ class DurableObjectFacets {
           status: response.status,
           headers: response.headers,
           __wsTarget: response.wsTarget,
+          __nativeUpgrade: response.wsNative,
         }), req.url);
       });
     };
@@ -2429,8 +2456,18 @@ class ContainerPort {
       __container_address(this._scope, this._port), options);
   }
 }
+const __containerBrands = new WeakMap();
+const __allocationReceiver = (receiver) => {
+  const brand = __containerBrands.get(receiver);
+  if (!brand || typeof brand.token !== "string")
+    throw new TypeError("allocation receiver or activation is invalid");
+  return brand;
+};
+const __allocationObject = (value) => value !== null && typeof value === "object" &&
+  (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 class Container {
   constructor(scope) {
+    __containerBrands.set(this, { token: __container_bind(scope, true) });
     this._scope = scope;
     this._destroyReason = undefined;
   }
@@ -2463,6 +2500,51 @@ class Container {
     this._destroyReason = undefined;
     __container_start(this._scope, JSON.stringify(params)).catch(() => {});
   }
+  async startAllocation(options) {
+    const brand = __allocationReceiver(this);
+    if (!__allocationObject(options))
+      throw new TypeError("startAllocation requires an options object");
+    const allowed = new Set(["id", "image", "engineImage", "platform", "env", "entrypoint", "enableInternet"]);
+    for (const name of Object.keys(options)) {
+      if (!allowed.has(name)) throw new TypeError("unknown allocation option");
+    }
+    for (const name of ["id", "image", "engineImage", "platform"]) {
+      if (typeof options[name] !== "string") throw new TypeError("allocation identities must be strings");
+    }
+    if (options.enableInternet !== undefined && typeof options.enableInternet !== "boolean")
+      throw new TypeError("enableInternet must be a boolean");
+    if (options.env !== undefined && !__allocationObject(options.env))
+      throw new TypeError("allocation env must be a plain object of strings");
+    const env = Object.entries(options.env ?? {});
+    if (env.some(([name, value]) => typeof value !== "string" || !name || name.includes("=") || name.includes("\0") || value.includes("\0")))
+      throw new TypeError("allocation env must contain valid string entries");
+    if (options.entrypoint !== undefined && !Array.isArray(options.entrypoint))
+      throw new TypeError("allocation entrypoint must be an array of strings");
+    const entrypoint = options.entrypoint === undefined ? undefined : [...options.entrypoint];
+    if (entrypoint?.some(value => typeof value !== "string" || value.includes("\0")))
+      throw new TypeError("allocation entrypoint must be an array of strings");
+    const size = [options.id, options.image, options.engineImage, options.platform,
+      ...env.flat(), ...(entrypoint ?? [])].reduce((sum, text) => sum + text.length, 0);
+    if (size > 65536) throw new RangeError("allocation options exceed limit");
+    const params = {
+      id: options.id, image: options.image, engineImage: options.engineImage,
+      platform: options.platform, enableInternet: options.enableInternet ?? false,
+      env, entrypoint,
+    };
+    const result = JSON.parse(await __container_start_allocation(brand.token, JSON.stringify(params)));
+    this._destroyReason = undefined;
+    return result;
+  }
+  async inspectAllocation(id) {
+    const brand = __allocationReceiver(this);
+    if (typeof id !== "string") throw new TypeError("allocation id must be a string");
+    return JSON.parse(await __container_inspect_allocation(brand.token, id));
+  }
+  async destroyAllocation(id) {
+    const brand = __allocationReceiver(this);
+    if (typeof id !== "string") throw new TypeError("allocation id must be a string");
+    return JSON.parse(await __container_destroy_allocation(brand.token, id));
+  }
   async monitor() {
     if (!this.running)
       throw new Error("monitor() cannot be called on a container that is not running.");
@@ -2486,7 +2568,6 @@ class Container {
     }
   }
   async destroy(error) {
-    if (!this.running) return;
     if (this._destroyReason === undefined) this._destroyReason = error;
     await __container_destroy(this._scope);
   }
@@ -2579,9 +2660,24 @@ class Container {
     return Promise.reject(new Error("interceptOutboundTcp() is not implemented in celld"));
   }
 }
+const __nativeActorStates = new WeakMap();
+const __captureNativeGeneration = (scope) => {
+  const generation = __ws_native_generation(scope);
+  const state = __cell.instances[scope]?.__celldState;
+  if (state && __nativeActorStates.get(state) === undefined)
+    __nativeActorStates.set(state, generation);
+  return generation;
+};
+const __resetNativeActor = (scope, generation) => {
+  if (generation === undefined) return false;
+  const reset = __ws_reset_native_actor(scope, generation);
+  __retireNativeGeneration(scope, generation);
+  return reset;
+};
 class DurableObjectState {
   constructor(scope) {
     this._scope = scope;
+    __nativeActorStates.set(this, __ws_native_generation(scope, true));
     this._aborted = false;
     this.storage = new DurableObjectStorage(scope, this);
     this.facets = new DurableObjectFacets(this);
@@ -2658,13 +2754,16 @@ class DurableObjectState {
     // queue behind the first. Calling this inside the async body instead
     // costs one microtask, and an event delivered in that window walks
     // straight into the critical section.
-    const [eventText, owner, acquired] = __gate_acquire(this._scope);
+    const nativeGeneration = __nativeActorStates.get(this) ?? __ws_native_generation(this._scope, true);
+    if (nativeGeneration !== undefined) __nativeActorStates.set(this, nativeGeneration);
+    const [eventText, owner, acquired] = __gate_acquire(this._scope, nativeGeneration);
     // An empty owner is an immediate refusal. Return its already-rejected
     // promise before recording the block, because no driver exists to settle
     // native work or to repair a readiness gate installed for stale work.
     if (owner === "") return acquired;
     const event = Number(eventText);
     const { block, record } = __blockEnter(this._scope, event, owner);
+    record.nativeGeneration = nativeGeneration;
     const next = (async () => {
       try {
         await acquired;
@@ -2762,37 +2861,34 @@ class DurableObjectState {
   }
   _resetAfterConcurrencyFailure(error) {
     if (this._aborted) return;
+    const generation = __nativeActorStates.get(this);
+    const reset = __currentActorScope() === this._scope
+      ? __resetNativeActor(this._scope, generation)
+      : __actorBreak(this._scope, error, generation);
+    if (!reset) return;
     this._aborted = true;
-    __storage_cancel_pending_puts(this._scope);
     const instance = __cell.instances[this._scope];
     if (instance && instance.__celldState === this)
       delete __cell.instances[this._scope];
-    // Under a stub-mediated caller (this scope is not the current
-    // event) the failure breaks the actor, as Workerd joins it
-    // into the on-abort promise; a direct event keeps reset-only
-    // semantics -- its caller sees the rejection itself.
-    if (__currentActorScope() !== this._scope)
-      __actorBreak(this._scope, error);
   }
   abort(reason) {
     if (this._aborted) return;
+    const generation = __nativeActorStates.get(this);
+    if (generation === undefined || !__ws_native_generation_live(this._scope, generation)) return;
+    const message = reason instanceof Error ? reason.message : String(reason);
+    // coercing the reason can run user code and reset this incarnation.
+    if (!__ws_native_generation_live(this._scope, generation)) return;
+    const direct = __currentActorScope() === this._scope;
+    if (!direct && !__actorBreak(this._scope,
+        reason instanceof Error ? reason : new Error(message), generation)) return;
     this._aborted = true;
-    __storage_cancel_pending_puts(this._scope);
     const instance = __cell.instances[this._scope];
     if (instance && instance.__celldState === this)
       delete __cell.instances[this._scope];
-    const message = reason instanceof Error
-      ? reason.message
-      : String(reason);
-    // Direct host-dispatched event on this actor: the uncatchable
-    // terminate_execution path. Under a same-isolate stub caller,
-    // termination would unwind the caller too, so break in JS.
-    if (__currentActorScope() === this._scope) {
-      __actor_abort(this._scope, message);
-      return;
+    if (direct) {
+      __retireNativeGeneration(this._scope, generation);
+      __actor_abort(this._scope, message, generation);
     }
-    __actorBreak(this._scope,
-      reason instanceof Error ? reason : new Error(message));
   }
   _ready() { return this._gate; }
   getWebSockets(tag) {
@@ -2963,6 +3059,7 @@ __celld.__retireInputGateContext = (context) => {
     // `finally`. Reset the actor, and release the host gate when the context
     // that started the callback differs from the turn that owns its work.
     const [holderEvent, holderRecord] = holder;
+    __resetNativeActor(scope, holderRecord.nativeGeneration);
     __gate_release(
       scope,
       holderEvent,
@@ -2970,10 +3067,11 @@ __celld.__retireInputGateContext = (context) => {
       "the cell's critical section ended without releasing",
     );
     const instance = __cell.instances[scope];
-    if (instance !== undefined) instance.__celldState._aborted = true;
-    __storage_cancel_pending_puts(scope);
-    if (instance !== undefined && __cell.instances[scope] === instance)
-      delete __cell.instances[scope];
+    if (instance !== undefined &&
+        __nativeActorStates.get(instance.__celldState) === holderRecord.nativeGeneration) {
+      instance.__celldState._aborted = true;
+      if (__cell.instances[scope] === instance) delete __cell.instances[scope];
+    }
     for (const record of block.events.values()) {
       record.retired = true;
       record.settleReady();
@@ -3017,6 +3115,15 @@ const __raceCallerAbort = (dispatch, signal, abandon) =>
     );
   });
 const __awaitCancellableDoCall = (operation, signal) => {
+  // a cancelled caller can lose the race after the host delivered its 101.
+  // release only a native claim already transferred into this caller context.
+  operation.then((raw) => {
+    if (!signal.aborted || typeof raw !== "string") return;
+    try {
+      const response = JSON.parse(raw);
+      if (response.wsNative) __ws_release_native(response.wsNative);
+    } catch {}
+  }, () => {});
   if (signal.aborted) {
     __do_call_cancel(operation.__celldCancelId);
     return Promise.reject(signal.reason);
@@ -3608,7 +3715,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
         : Uint8Array.from(r.bodyBytes || []);
     return __finishServiceFetch(
       new Response(responseBody, {
-        status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+        status: r.status, headers: r.headers, __wsTarget: r.wsTarget, __nativeUpgrade: r.wsNative,
       }),
       req, redirectState);
   },
@@ -3946,12 +4053,14 @@ const __newEntry = (target) => {
 // scope rejects with the reason. Direct host-dispatched DO events
 // keep the uncatchable terminate_execution path.
 const __brokenActors = new Map();
-const __actorBreak = (scope, reason) => {
-  if (__brokenActors.has(scope)) return;
-  __brokenActors.set(scope, reason);
+const __actorBreak = (scope, reason, generation) => {
+  if (generation === undefined || !__ws_reset_native_actor(scope, generation)) return false;
+  if (!__brokenActors.has(scope)) __brokenActors.set(scope, reason);
   for (const entry of __stubEntries.values())
     if (entry.scope === scope)
       __ctxAbort(entry.ctx, new __ActorAbort(reason));
+  __retireNativeGeneration(scope, generation);
+  return true;
 };
 // Everything this isolate holds for one cell scope that belongs to the
 // cell's residency rather than to the isolate, so a fresh instance
@@ -3960,6 +4069,7 @@ const __actorBreak = (scope, reason) => {
 // Storage is not here -- `stop_cell` closes it host-side -- and sockets
 // live in the host registry, so a hibernated cell keeps them.
 const __cellRelease = (scope) => {
+  __retireNativeGeneration(scope);
   __cell.instances[scope]?.ctx?.facets?._release();
   delete __cell.instances[scope];
   delete __cell.idNames[scope];
@@ -5254,7 +5364,7 @@ class DurableObjectNamespace {
         return new Response(body, {
           status: r.status,
           headers: r.headers,
-          __wsTarget: r.wsTarget,
+          __wsTarget: r.wsTarget, __nativeUpgrade: r.wsNative,
           webSocket: r.status === 101 && r.wsTarget
             ? new WebSocket(undefined, [], r.wsTarget)
             : undefined,
@@ -5377,7 +5487,8 @@ const __dispatchTo = __celld.__dispatchTo = async (
     // controller rather than this one.
     __attachResponseRequestCancellation(response, requestController, false);
     if (response instanceof Response && response.status === 101 &&
-        response.webSocket && !response.webSocket._target) {
+        response.webSocket && !response.webSocket._nativeUpgrade &&
+        !response.webSocket._target) {
       const socket = response.webSocket._peer;
       const target = { id: response.webSocket._id, scope };
       response.webSocket._target = target;
@@ -6639,7 +6750,7 @@ class __QueueCell {
     }
     if (armAt === null) await this.ctx.storage.deleteAlarm();
     else if (waitForWake) {
-      await __queue_alarm_set_wait(this.ctx.storage._scope, armAt);
+      await __queue_alarm_set_wait(__storageReceiver(this.ctx.storage), armAt);
     } else await this.ctx.storage.setAlarm(armAt);
   }
 
@@ -7627,7 +7738,7 @@ class __D1DatabaseCell {
   // Takes an array so that `batch()` can ride this same method, and the
   // same turn, when it lands.
   __d1Query(statements) {
-    const scope = this.ctx.storage.sql._scope;
+    const scope = __storageReceiver(this.ctx.storage);
     return statements.map((statement) =>
       __d1Run(scope, {
         mode: "prepared",
@@ -7638,7 +7749,7 @@ class __D1DatabaseCell {
     );
   }
   __d1Batch(statements) {
-    return __d1Run(this.ctx.storage.sql._scope, {
+    return __d1Run(__storageReceiver(this.ctx.storage), {
       mode: "batch",
       statements: statements.map((statement) => ({
         sql: String(statement.sql),
@@ -7671,7 +7782,7 @@ class __D1DatabaseCell {
         );
       } else if (body.exec !== undefined) {
         // The CLI asks for rows; the Worker binding's exec() never does.
-        result = __d1Run(this.ctx.storage.sql._scope, {
+        result = __d1Run(__storageReceiver(this.ctx.storage), {
           mode: "exec",
           sql: String(body.exec.sql),
           rows: !!body.exec.rows,
@@ -7685,7 +7796,7 @@ class __D1DatabaseCell {
     }
   }
   __d1Exec(source) {
-    const result = __d1Run(this.ctx.storage.sql._scope, {
+    const result = __d1Run(__storageReceiver(this.ctx.storage), {
       mode: "exec",
       sql: String(source),
       rows: false,
@@ -7699,7 +7810,7 @@ class __D1DatabaseCell {
   // operator fixes the file and re-runs. Without the transaction the
   // statements that DID land are exactly the ones a re-run trips over.
   __d1Migrate(name, source, table) {
-    return __d1Run(this.ctx.storage.sql._scope, {
+    return __d1Run(__storageReceiver(this.ctx.storage), {
       mode: "migrate",
       name,
       sql: source,
@@ -8736,14 +8847,15 @@ const __wfMakeStep = (driver) => {
 const __WorkflowCell = (() => {
   class StorageTransaction {
     constructor(storage) {
+      __storageReceivers.set(this, __storageReceiver(storage));
       this.kv = storage.kv;
       this._scope = storage._scope;
     }
     setAlarm(t) {
-      __alarm_set(this._scope, t instanceof Date ? t.getTime() : Number(t));
+      __alarm_set(__storageReceiver(this), t instanceof Date ? t.getTime() : Number(t));
     }
     deleteAlarm() {
-      __alarm_delete(this._scope);
+      __alarm_delete(__storageReceiver(this));
     }
   }
   const transactionSync = (storage, callback) =>
@@ -10363,6 +10475,31 @@ for (const n of ["BroadcastChannel", "FileReader"]) {
   };
 }
 const __sockets = __celld.__sockets = new Map();
+const __nativeSocketOwners = new WeakMap();
+const __retireNativeGeneration = __celld.__retireNativeGeneration = (scope, generation) => {
+  for (const socket of __sockets.values()) {
+    const owner = __nativeSocketOwners.get(socket);
+    if (owner?.scope === scope && (generation === undefined || owner.generation === generation))
+      socket._retireNative();
+  }
+};
+const __nativeUpgradeFinalizer = new FinalizationRegistry(
+  (claim) => __ws_drop_native_handle(claim));
+const __trackNativeSocket = (socket) => {
+  const claim = __ws_track_native(socket._nativeUpgrade);
+  __nativeUpgradeFinalizer.register(socket, claim);
+};
+const __makeNativeSocket = (id, protocol) => {
+  __captureNativeGeneration(__currentActorScope());
+  const socket = __makeSocket(id);
+  socket._outbound = true;
+  socket._nativeUpgrade = id;
+  socket._polled = !__currentActorScope();
+  socket.readyState = WebSocket.READY_STATE_OPEN;
+  socket.protocol = protocol;
+  __trackNativeSocket(socket);
+  return socket;
+};
 globalThis.WebSocket = class WebSocket extends EventTarget {
   // The spec names, which workerd exposes and real bundles use. celld only
   // had the READY_STATE_* aliases, which no other runtime defines.
@@ -10538,7 +10675,36 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   set binaryType(value) {
     if (value === "blob" || value === "arraybuffer") this._binaryType = value;
   }
+  _consumeNativeOnUse() {
+    if (this._nativeUpgrade && !this._accepted) this.accept();
+  }
+  addEventListener(type, callback, options) {
+    super.addEventListener(type, callback, options);
+    if (callback != null && !options?.signal?.aborted &&
+        ["open", "message", "error", "close"].includes(String(type)))
+      this._consumeNativeOnUse();
+  }
   accept() {
+    if (this._nativeUpgrade) {
+      if (this._nativeTransferred)
+        throw new TypeError("WebSocket transport was transferred");
+      if (this._accepted) return;
+      if (this.readyState !== WebSocket.READY_STATE_OPEN)
+        throw new TypeError("WebSocket transport is closed");
+      const scope = __currentActorScope();
+      const generation = __captureNativeGeneration(scope);
+      const [opening, ended] = __ws_consume_native(this._nativeUpgrade);
+      __nativeSocketOwners.set(this, { scope, generation });
+      __sockets.set(this._id, this);
+      this._accepted = true;
+      __registerWaitUntil(opening.catch(() => {}));
+      // this notification belongs to the original consumer continuation,
+      // not a newly routed actor event. it is not request-extending work.
+      ended.then((raw) => this._deliverNativeClose(JSON.parse(raw)))
+        .catch(() => this._retireNative());
+      if (this._polled) this._startPump();
+      return;
+    }
     this._accepted = true;
     // A pair used directly, without being returned through a 101 response,
     // still has to carry frames once both ends are accepted. celld only
@@ -10567,6 +10733,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     }
   }
   send(data) {
+    this._consumeNativeOnUse();
     if (this.readyState !== WebSocket.READY_STATE_OPEN)
       throw new DOMException("WebSocket is not open", "InvalidStateError");
     const binary = data instanceof ArrayBuffer || ArrayBuffer.isView(data);
@@ -10620,6 +10787,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     if (this._outbound && this.readyState === WebSocket.READY_STATE_CLOSED) {
       return;
     }
+    this._consumeNativeOnUse();
     const connecting = this.readyState === WebSocket.READY_STATE_CONNECTING;
     this.readyState = WebSocket.READY_STATE_CLOSING;
     if (this._outbound && connecting) {
@@ -10671,7 +10839,44 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     event._trust();
     this.dispatchEvent(event);
   }
+  async _deliverNativeClose(close) {
+    const owner = __nativeSocketOwners.get(this);
+    const live = () => owner && __ws_native_generation_live(owner.scope, owner.generation);
+    if (close.notify === false || !live()) { this._retireNative(); return; }
+    if (!owner.scope) {
+      this._dispatchClose(close.code, close.reason, close.clean);
+      return;
+    }
+    for (;;) {
+      if (!live()) { this._retireNative(); return; }
+      await __gate_wait(owner.scope, owner.generation);
+      if (!live()) { this._retireNative(); return; }
+      // refreshing rpc signals can invoke user code, so do not begin an event
+      // behind a gate that closed after the host wake.
+      if (!__gate_is_open(owner.scope)) continue;
+      const event = __beginActorEvent(owner.scope);
+      try {
+        // a different delivery can acquire the gate between the host wake and
+        // this promise reaction. check again without yielding before listeners.
+        if (!live()) { this._retireNative(); return; }
+        if (!__gate_is_open(owner.scope)) continue;
+        this._dispatchClose(close.code, close.reason, close.clean);
+        return;
+      } finally {
+        __endActorEvent(event);
+      }
+    }
+  }
+  _retireNative() {
+    this.readyState = WebSocket.READY_STATE_CLOSED;
+    __sockets.delete(this._id);
+  }
   _dispatchClose(code, reason, wasClean) {
+    const owner = __nativeSocketOwners.get(this);
+    if (owner && !__ws_native_generation_live(owner.scope, owner.generation)) {
+      this._retireNative();
+      return;
+    }
     if (this.readyState === WebSocket.READY_STATE_CLOSED) return;
     this.readyState = WebSocket.READY_STATE_CLOSED;
     __sockets.delete(this._id);
@@ -10691,11 +10896,23 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
           : "WebSocket closed abnormally",
       }));
     }
+    if (owner && !__ws_native_generation_live(owner.scope, owner.generation)) return;
     const event = new CloseEvent("close", { code, reason, wasClean });
     event._trust();
     this.dispatchEvent(event);
   }
 };
+for (const type of ["open", "message", "error", "close"]) {
+  Object.defineProperty(WebSocket.prototype, "on" + type, {
+    configurable: true,
+    enumerable: true,
+    get() { return __getEventHandler(this, type); },
+    set(handler) {
+      __setEventHandler(this, type, handler);
+      if (typeof handler === "function") this._consumeNativeOnUse();
+    },
+  });
+}
 const __makeSocket = __celld.__makeSocket = (id) => new WebSocket(id);
 const __socketFromRow = __celld.__socketFromRow = (row) => {
   let ws = __sockets.get(Number(row.id));
@@ -11449,8 +11666,18 @@ __celld.__readResponse = (r) => {
   if (r.type === "error" || r.status === 0)
     return { error: __ERROR_RESPONSE_MESSAGE };
   let workerSocketId = 0;
+  let nativeSocketId = 0;
+  if (r.webSocket?._nativeUpgrade) {
+    const socket = r.webSocket;
+    if (r.status !== 101 || socket._accepted || socket._nativeTransferred ||
+        socket.readyState !== WebSocket.READY_STATE_OPEN)
+      throw new TypeError("WebSocket transport is consumed, closed or already transferred");
+    nativeSocketId = socket._nativeUpgrade;
+    socket._nativeTransferred = true;
+    __sockets.delete(socket._id);
+  }
   let wsTarget = r._wsTarget || (r.webSocket && r.webSocket._target) || null;
-  if (r.status === 101 && r.webSocket && wsTarget === null) {
+  if (r.status === 101 && r.webSocket && wsTarget === null && !nativeSocketId) {
     const server = r.webSocket._peer;
     if (server && server._accepted) {
       workerSocketId = server._id;
@@ -11482,6 +11709,7 @@ __celld.__readResponse = (r) => {
       headersJson: JSON.stringify(Array.from(r.headers)),
       wsTargetJson: JSON.stringify(wsTarget),
       workerSocketId,
+      nativeSocketId,
     };
   }
   const bytes = r._bodyBytes;
@@ -11492,5 +11720,6 @@ __celld.__readResponse = (r) => {
     headersJson: JSON.stringify(Array.from(r.headers)),
     wsTargetJson: JSON.stringify(wsTarget),
     workerSocketId,
+    nativeSocketId,
   };
 };

@@ -64,6 +64,13 @@ lists each gap in the services above.
 
 ## Install
 
+This fork includes Grapefuit's native container allocation, WebSocket forwarding
+and cooperative hand-off changes. The patch originates from celld `v0.6.2` and
+is carried here on `v0.6.3`, retaining its ownership-recovery and TLS updates.
+See [native allocations](docs/services/containers.md#native-allocations-in-this-fork)
+for the API and required host preparation. The upstream installer below does
+not install this fork's changes.
+
 The installer downloads the `celld` binary (provenance is verifiable with
 `gh attestation verify`):
 

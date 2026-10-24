@@ -38,6 +38,30 @@ impl std::fmt::Display for RoutedRequestError {
 
 impl std::error::Error for RoutedRequestError {}
 
+pub fn route_error_result(error: anyhow::Error) -> anyhow::Result<HttpResponse> {
+    if !matches!(
+        error.downcast_ref::<RoutedRequestError>(),
+        Some(RoutedRequestError(
+            RequestError::CooperativeRetirementRequired
+        ))
+    ) {
+        return Err(error);
+    }
+    // return a response through the ordinary do fetch bridge, not an untyped
+    // javascript rejection which the outer worker would turn into plain text.
+    Ok(HttpResponse {
+        status: 503,
+        body:
+            br#"{"error":"CooperativeRetirementRequired","code":"cooperative-retirement-required"}"#
+                .to_vec(),
+        headers: vec![("content-type".into(), "application/json".into())],
+        stream: None,
+        websocket: None,
+        write_position: None,
+        observed_position: None,
+    })
+}
+
 /// The output gate for an effect raised inside a handler, as opposed to the
 /// handler's own response.
 ///
@@ -343,6 +367,9 @@ async fn dispatch_local_fetch(
             // has installed its request context. That context now
             // owns an unread tail through its waitUntil work.
             body_guard.disarm();
+            if matches!(&response.websocket, Some(HttpResponseWebSocket::Native(_))) {
+                anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+            }
             if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
                 accepted = Some(target.clone());
                 // workerd applies this check in the object's own response

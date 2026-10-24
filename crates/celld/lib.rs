@@ -13,6 +13,8 @@ mod tokio_select;
 pub use tokio_select::__asyncrt_select_support;
 
 pub mod actor;
+#[cfg(all(debug_assertions, unix))]
+mod allocation_debug;
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_core_loop_tests {
     include!(env!("CELLD_CONFORMANCE_CORE_LOOP_TESTS"));
@@ -56,6 +58,7 @@ pub mod docker;
 pub mod drain_token;
 pub mod engine_api;
 pub mod env_vars;
+pub mod native_handoff;
 #[cfg(celld_internal_tests)]
 #[allow(clippy::disallowed_methods)]
 #[doc(hidden)]
@@ -76,6 +79,7 @@ pub mod ltx_repl;
 pub mod ltx_replication;
 pub mod machine;
 pub mod memory;
+pub mod native_ws;
 pub mod node_log;
 pub(crate) mod operator_cell;
 #[doc(hidden)]
