@@ -431,6 +431,8 @@ struct Cell {
     waiting_activation: Option<ColdStart>,
     /// The in-flight release of this cell's ownership record, if any.
     releasing: Option<OpId>,
+    /// A completed dormant stop stays valid across bounded owner-write retries.
+    dormant_retired: bool,
     /// Whether the eviction now under way hands this cell to the fleet.
     evict_rebalance: bool,
     /// The epoch this node holds the record at, kept across the transient
@@ -602,6 +604,7 @@ impl Default for Cell {
             waiting_for: None,
             waiting_activation: None,
             releasing: None,
+            dormant_retired: false,
             evict_rebalance: false,
             held_epoch: None,
             handoff: false,
@@ -1255,6 +1258,23 @@ impl State {
             .saturating_add(self.eviction_permits.len())
             .saturating_add(self.releasing())
             .saturating_add(self.adopting())
+            .saturating_add(self.retiring_dormant())
+    }
+
+    /// Local retirement holds a handoff permit but no residency capacity.
+    pub fn retiring_dormant(&self) -> usize {
+        self.cells
+            .values()
+            .filter(|cell| {
+                matches!(
+                    cell.phase,
+                    Phase::Cleaning {
+                        cause: StopCause::DormantRelease,
+                        ..
+                    }
+                )
+            })
+            .count()
     }
 
     /// Completed successor ownership acknowledgements during this process lifetime.
@@ -1375,6 +1395,10 @@ impl State {
             let in_pipeline = match cell.phase {
                 Phase::Dormant { .. } => cell.releasing.is_some(),
                 Phase::Adopting { .. } => true,
+                Phase::Cleaning {
+                    cause: StopCause::DormantRelease,
+                    ..
+                } => true,
                 _ => false,
             };
             if cell.handoff && !in_pipeline {
@@ -4705,6 +4729,15 @@ impl State {
                     cell: id.clone(),
                 });
             }
+            Ok(CasOutcome::CooperativeRetirementRequired) => {
+                set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+                self.finish_requests(
+                    &id,
+                    &mut cell,
+                    Err(RequestError::CooperativeRetirementRequired),
+                    effects,
+                );
+            }
             Err(Failure::Ambiguous) if claim.reconciles < MAX_ACQUIRE_RECONCILES => {
                 let next = self.cell_op(&id);
                 let claim = Claim {
@@ -5093,6 +5126,18 @@ impl State {
             self.finish_eviction(op, Ok(EvictSuccess::Evicted), effects);
         }
         match cause {
+            StopCause::DormantRelease => {
+                set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
+                cell.dormant_retired = true;
+                let release = self.cell_op(&id);
+                cell.releasing = Some(release);
+                self.releasing_cells.insert(id.clone());
+                effects.push(Effect::ReleaseOwner {
+                    op: release,
+                    cell: id.clone(),
+                    epoch,
+                });
+            }
             StopCause::Cleanup => {
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::PublishFailed), effects);
@@ -5126,6 +5171,7 @@ impl State {
                 // node that has already decided it has no room. Publishing it
                 // as unowned is what turns an eviction into shed load.
                 if rebalance {
+                    cell.dormant_retired = true;
                     let op = self.cell_op(&id);
                     cell.releasing = Some(op);
                     self.releasing_cells.insert(id.clone());
@@ -5653,15 +5699,7 @@ impl State {
             if in_flight >= self.config.max_releases {
                 return;
             }
-            let op = self.cell_op(&id);
-            let cell = self.cells.get_mut(&id).expect("dormant Queue listed above");
-            cell.releasing = Some(op);
-            self.releasing_cells.insert(id.clone());
-            effects.push(Effect::ReleaseOwner {
-                op,
-                cell: id,
-                epoch,
-            });
+            self.release_dormant(&id, epoch, effects);
             in_flight += 1;
         }
 
@@ -5735,8 +5773,8 @@ impl State {
         // a sticky eviction, hibernation, or a release whose write failed
         // -- so a later request could resume locally. On a leaving node
         // that record only makes a successor wait out the node lease. The
-        // runtime is already stopped, so the drain releases the record
-        // directly.
+        // runtime may have failed after restore, so retire any remaining
+        // local resources before releasing its record.
         #[cfg(celld_internal_tests)]
         self.record_drain_table_visits(self.cells.len());
         let dormant: Vec<(CellId, Epoch)> = self
@@ -5756,15 +5794,32 @@ impl State {
         }
     }
 
-    /// Release one dormant cell's record for a successor. The runtime is
-    /// already stopped, so this is the record write alone.
+    /// Retire any failed-start replica and facets under a non-expiring stop
+    /// before starting the bounded ownership write.
     fn release_dormant(&mut self, id: &str, epoch: Epoch, effects: &mut Vec<Effect>) {
         let op = self.cell_op(id);
         let handoff = !self.draining;
         let cell = self.cells.get_mut(id).expect("dormant cell listed above");
-        cell.releasing = Some(op);
         cell.handoff = handoff;
-        self.releasing_cells.insert(id.to_string());
+        if cell.dormant_retired {
+            cell.releasing = Some(op);
+            self.releasing_cells.insert(id.to_string());
+            effects.push(Effect::ReleaseOwner {
+                op,
+                cell: id.to_string(),
+                epoch,
+            });
+            return;
+        }
+        set_phase(
+            &mut self.occupied,
+            cell,
+            Phase::Cleaning {
+                op,
+                epoch,
+                cause: StopCause::DormantRelease,
+            },
+        );
         // A hibernated cell parks its sockets past the runtime, and
         // nothing else on the handoff path visits them: without this
         // close the process exit tears them down as an abnormal
@@ -5780,22 +5835,22 @@ impl State {
                 keep_hibernatable: false,
             });
         }
-        effects.push(Effect::ReleaseOwner {
+        effects.push(Effect::StopRuntime {
             op,
             cell: id.to_string(),
             epoch,
+            cause: StopCause::DormantRelease,
+            bounded: false,
         });
     }
 
     /// Give up to `count` hibernated cells to the fleet without draining.
     ///
-    /// Only a dormant cell moves: its move is one record write and one
-    /// signed acquire, it cannot park a request behind a durability proof,
-    /// and the receiver restores it when traffic returns. A resident cell
-    /// hibernates through the ordinary idle eviction first and moves after.
-    /// The drain's eviction pipeline is not used here: a drain cannot
-    /// abandon a cell whose final proof stalls, and a balancing move must.
-    /// On the 2026-09-03 fleet that pipeline parked whales without end. A
+    /// Only a dormant cell moves. Usually its local resources are already
+    /// retired, but failed startup can leave replicas and facets requiring
+    /// a final proof. That retirement must finish before owner release or
+    /// new demand can restore the cell again. A resident cell hibernates
+    /// through ordinary idle eviction first. A
     /// cell with a pending request or an alarm about to fire stays. Every
     /// move shares the drain's release ceiling, and a node that is draining,
     /// fenced, or shedding moves nothing because those paths own its cells.
@@ -6614,7 +6669,12 @@ impl State {
                 }
                 _ => {}
             }
-            if let Some(epoch) = runtime_epoch(&cell.phase) {
+            // a failed startup may retain a workload even without a resident runtime.
+            let cleanup_epoch = runtime_epoch(&cell.phase).or(match &cell.phase {
+                Phase::Dormant { epoch } => Some(*epoch),
+                _ => None,
+            });
+            if let Some(epoch) = cleanup_epoch {
                 let op = self.op();
                 effects.push(Effect::StopRuntime {
                     op,
@@ -6661,29 +6721,23 @@ impl State {
     fn compensate_retired_runtime(
         &mut self,
         op: OpId,
-        result: Result<(), Failure>,
+        _result: Result<(), Failure>,
         effects: &mut Vec<Effect>,
     ) {
         let Some((cell, epoch)) = self.retired_runtime_ops.remove(&op) else {
             return;
         };
-        // Definite failure created nothing. Success or ambiguity may have
-        // created/published a runtime after authority was revoked, so cleanup
-        // is mandatory and idempotent.
-        if result != Err(Failure::Definite) {
-            let cleanup = self.op();
-            effects.push(Effect::StopRuntime {
-                op: cleanup,
-                cell,
-                epoch,
-                // This completion lost node authority before it became
-                // visible. It can close the database, but it cannot run the
-                // durability pass that an ordinary live cleanup uses to make
-                // the image a successor-epoch base.
-                cause: StopCause::Fence,
-                bounded: false,
-            });
-        }
+        // definite runtime failure does not settle ownership of an existing workload.
+        // the executor retains an exact startup target, independently of runtime commit.
+        let cleanup = self.op();
+        effects.push(Effect::StopRuntime {
+            op: cleanup,
+            cell,
+            epoch,
+            // revoked authority cannot publish a successor-epoch durability base.
+            cause: StopCause::Fence,
+            bounded: false,
+        });
     }
 }
 
@@ -6960,6 +7014,15 @@ fn same_node_lease(left: &NodeLeaseRecord, right: &NodeLeaseRecord) -> bool {
 }
 
 fn phase_occupies_capacity(phase: &Phase) -> bool {
+    if matches!(
+        phase,
+        Phase::Cleaning {
+            cause: StopCause::DormantRelease,
+            ..
+        }
+    ) {
+        return false;
+    }
     matches!(
         phase,
         Phase::Acquiring { dormant: false, .. }
@@ -6972,6 +7035,9 @@ fn phase_occupies_capacity(phase: &Phase) -> bool {
             | Phase::Resident { .. }
     )
 }
+
+#[cfg(test)]
+mod dormant_release_tests;
 
 fn phase_holds_activation(phase: &Phase) -> bool {
     matches!(
@@ -7013,6 +7079,9 @@ fn phase_requires_activation_permit(phase: &Phase, swapping: bool) -> bool {
 /// equal to the number of cells in a capacity-occupying phase, so nothing
 /// ever has to count them. `validate` asserts the equality by walking.
 fn set_phase(occupied: &mut usize, cell: &mut Cell, phase: Phase) {
+    if !matches!(phase, Phase::Dormant { .. }) {
+        cell.dormant_retired = false;
+    }
     if !matches!(&phase, Phase::Resident { .. }) {
         cell.quiescing = false;
     }

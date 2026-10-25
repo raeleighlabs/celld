@@ -64,6 +64,24 @@ lists each gap in the services above.
 
 ## Install
 
+This fork includes Grapefuit's native container allocation, WebSocket forwarding
+and cooperative hand-off changes. The patch originates from celld `v0.6.2` and
+is carried here on `v0.6.3`, retaining its ownership-recovery and TLS updates.
+See [native allocations](docs/services/containers.md#native-allocations-in-this-fork)
+for the API and required host preparation. The upstream installer below does
+not install this fork's changes.
+
+Fork pull requests run [CI](https://github.com/raeleighlabs/celld/actions/workflows/ci.yml)
+and upload checked Linux x86-64, Linux ARM64 and macOS ARM64 binaries, plus
+Linux amd64/arm64 OCI container archives. Each native bundle includes checksums,
+source/build identity, `LICENSE` and `NOTICE`.
+
+Fork releases use names such as `v0.6.3-grapefuit.1` and the image namespace
+`ghcr.io/raeleighlabs/celld`. The release workflow creates a checked draft first.
+Publishing that draft checks the tagged source again before publishing the
+multi-architecture image. See [fork CI and releases](docs/fork-ci.md) for
+downloads, commands and the boundary with private Grapefuit integration tests.
+
 The installer downloads the `celld` binary (provenance is verifiable with
 `gh attestation verify`):
 

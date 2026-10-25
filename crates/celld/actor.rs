@@ -30,6 +30,8 @@ use tokio_util::time::{delay_queue, DelayQueue};
 
 mod effects;
 mod local_request;
+#[cfg(test)]
+mod native_handoff_tests;
 mod production;
 pub use celld_logic::{EvictCancellation, EvictError, EvictFailure, EvictRefusal, EvictSuccess};
 pub use effects::StepOutput;
@@ -347,13 +349,22 @@ impl Ownership {
                     CasOutcome::Rejected
                 })
             }
-            Self::Bucket(bucket) => bucket.cas_owner(cell, guard, epoch).await.map_err(|error| {
-                // Any transport or 5xx failure may have happened after the
-                // store committed. The core reconciles by reading the owner
-                // again.
-                eprintln!("celld ownership CAS ambiguous: {error:#}");
-                Failure::Ambiguous
-            }),
+            Self::Bucket(bucket) => match bucket.cas_owner(cell, guard, epoch).await {
+                Err(error)
+                    if error.is::<crate::native_handoff::CooperativeRetirementRequired>() =>
+                {
+                    // only this typed pre-cas refusal proves no ownership write was attempted.
+                    eprintln!(
+                        "celld ownership acquisition refused: cooperative-retirement-required"
+                    );
+                    Ok(CasOutcome::CooperativeRetirementRequired)
+                }
+                result => result.map_err(|error| {
+                    // transport and cas uncertainty still require authoritative readback.
+                    eprintln!("celld ownership CAS ambiguous: {error:#}");
+                    Failure::Ambiguous
+                }),
+            },
         }
     }
 
@@ -671,6 +682,7 @@ pub struct DrainStatus {
     /// their successor routes while admitted work finishes.
     pub quiescing: usize,
     pub evicting: usize,
+    pub retiring_dormant: usize,
     /// Ownership releases still in flight. A handoff drain waits for zero:
     /// a released cell leaves `occupied` before its record write commits,
     /// so exiting on occupancy alone can abort the write mid-flight and
@@ -682,6 +694,18 @@ pub struct DrainStatus {
     /// Monotonic ownership acknowledgements. A progressing handoff can
     /// take longer than one stall interval when the node owns many cells.
     pub handed_off: u64,
+}
+
+impl DrainStatus {
+    pub fn handoff_complete(&self) -> bool {
+        self.occupied == 0
+            && self.activating == 0
+            && self.quiescing == 0
+            && self.evicting == 0
+            && self.retiring_dormant == 0
+            && self.releasing == 0
+            && self.adopting == 0
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1099,7 +1123,7 @@ struct EffectTiming {
 }
 
 pub struct CompletedEffect {
-    event: Event,
+    pub(crate) event: Event,
     timing: Option<EffectTiming>,
 }
 
@@ -1204,7 +1228,7 @@ impl CellRouteTiming {
 /// error. Neither this await nor the core's `Cleaning` phase has an overall
 /// timeout. A pending release must not trigger a restart against a database
 /// that the old runtime can still own; it can keep the eviction reply pending.
-async fn report_stopped_when_released<F, Fut>(
+pub(crate) async fn report_stopped_when_released<F, Fut>(
     op: OpId,
     cell: String,
     epoch: u64,
@@ -1232,7 +1256,9 @@ where
             );
             return CompletedEffect::plain(Event::RuntimeStopCancelled { op });
         }
-        if deadline_mono_ms.is_some_and(|deadline| crate::asyncrt::mono_ms() >= deadline) {
+        if !error.is::<crate::runtime::RuntimeRetirementPending>()
+            && deadline_mono_ms.is_some_and(|deadline| crate::asyncrt::mono_ms() >= deadline)
+        {
             tracing::warn!(
                 event,
                 %cell,
@@ -2866,6 +2892,7 @@ impl Actor {
                     activating: self.state.activating(),
                     quiescing: self.state.quiescing(),
                     evicting: self.state.evicting(),
+                    retiring_dormant: self.state.retiring_dormant(),
                     releasing: self.state.releasing(),
                     adopting: self.state.adopting(),
                     handed_off: self.state.handed_off(),
@@ -3428,8 +3455,34 @@ impl Actor {
                     );
                 }
                 let ownership = self.ownership.clone();
+                let host = self.host.clone();
                 out.spawn_scoped(async move {
-                    let result = ownership.release_owner(&cell, epoch).await;
+                    let release = async {
+                        if let Ownership::Bucket(bucket) = &ownership {
+                            if bucket.native_owner(&cell).await?.is_some() {
+                                if let Some(result) = bucket.release_inherited_native(&cell, epoch).await? {
+                                    return Ok(result);
+                                }
+                                let runtime = match &host {
+                                    Some(CellHost::Engine(runtime)) => runtime,
+                                    _ => anyhow::bail!("native release requires the real runtime"),
+                                };
+                                let engine = crate::container::engine().await?;
+                                let (checkpoint, attempts) = runtime.native_handoff_closure(&cell, epoch, engine).await?;
+                                return bucket.release_native(&cell, epoch, checkpoint, attempts).await;
+                            }
+                        }
+                        ownership.release_owner(&cell, epoch).await
+                            .map_err(|_| anyhow::anyhow!("owner release did not settle"))
+                    };
+                    let result = match crate::asyncrt::timeout(crate::native_handoff::DEADLINE, release).await {
+                        Ok(Ok(result)) => Ok(result),
+                        Ok(Err(error)) => {
+                            tracing::warn!(event = "native_owner_release_refused", %cell, epoch, %error);
+                            Err(Failure::Definite)
+                        }
+                        Err(_) => Err(Failure::Ambiguous),
+                    };
                     CompletedEffect::plain(Event::OwnerReleased { op, result })
                 });
             }
@@ -3749,13 +3802,13 @@ impl Actor {
                     let timing_cell = cell.clone();
                     out.spawn_scoped(async move {
                         let started = crate::asyncrt::mono_ms();
-                        let placed = runtime
-                            .start_cell(cell.clone(), epoch, fresh)
-                            .await
-                            .map_err(|error| {
-                                eprintln!("celld runtime start failed for {cell}: {error:#}");
-                                Failure::Definite
-                            });
+                        let startup = runtime.start_cell(cell.clone(), epoch, fresh);
+                        #[cfg(all(debug_assertions, unix))]
+                        let startup = crate::allocation_debug::startup(&cell, epoch, op, startup);
+                        let placed = startup.await.map_err(|error| {
+                            eprintln!("celld runtime start failed for {cell}: {error:#}");
+                            Failure::Definite
+                        });
                         let isolate = placed.as_ref().ok().map(|(isolate, _)| *isolate);
                         let generation = placed
                             .as_ref()
@@ -4041,6 +4094,7 @@ impl Actor {
                         signal
                     });
                     let stop_mode = match cause {
+                        StopCause::DormantRelease => crate::runtime::StopMode::DormantRelease,
                         StopCause::Evict { rebalance } => crate::runtime::StopMode::Evict {
                             preserve_local: !rebalance,
                             abandon,
@@ -4402,7 +4456,9 @@ fn request_error_phase(error: RequestError) -> &'static str {
         RequestError::NodeUnavailable | RequestError::NodeFenced => "node_authority",
         RequestError::ResolveFailed | RequestError::PeerIncompatible => "ownership_lookup",
         RequestError::CapacityExhausted => "capacity_wait",
-        RequestError::AcquireFailed => "ownership_acquire",
+        RequestError::AcquireFailed | RequestError::CooperativeRetirementRequired => {
+            "ownership_acquire"
+        }
         RequestError::RestoreFailed => "restore",
         RequestError::RuntimeFailed => "isolate_startup",
         RequestError::PublishFailed => "registry_insert",

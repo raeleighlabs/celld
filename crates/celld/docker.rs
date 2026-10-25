@@ -28,6 +28,7 @@ const API: &str = "";
 #[derive(Clone, Debug)]
 pub struct Docker {
     socket: PathBuf,
+    response_limit: Option<usize>,
 }
 
 /// A raw bidirectional stream the daemon hijacked for an exec or attach.
@@ -57,7 +58,13 @@ impl Docker {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            response_limit: None,
         }
+    }
+
+    pub fn with_response_limit(mut self, limit: usize) -> Self {
+        self.response_limit = Some(limit);
+        self
     }
 
     /// The daemon socket: `DOCKER_HOST` when it names a unix socket, else
@@ -142,6 +149,9 @@ impl Docker {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<Reply> {
+        if let Some(limit) = self.response_limit {
+            return self.call_bounded(method, path, body, limit).await;
+        }
         let body = match body {
             Some(value) => Bytes::from(serde_json::to_vec(&value)?),
             None => Bytes::new(),
@@ -155,6 +165,38 @@ impl Docker {
             .context("read Docker response")?
             .to_bytes();
         Ok(Reply { status, body })
+    }
+
+    // collect frames incrementally so an untrusted daemon cannot force an unbounded allocation.
+    pub async fn call_bounded(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        limit: usize,
+    ) -> anyhow::Result<Reply> {
+        let body = match body {
+            Some(value) => Bytes::from(serde_json::to_vec(&value)?),
+            None => Bytes::new(),
+        };
+        let (response, _sender) = self.send(self.request(method, path, body)?).await?;
+        let status = response.status();
+        let mut incoming = response.into_body();
+        let mut bytes = bytes::BytesMut::new();
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame.context("read bounded Docker response")?;
+            if let Some(data) = frame.data_ref() {
+                anyhow::ensure!(
+                    data.len() <= limit.saturating_sub(bytes.len()),
+                    "Docker response exceeds limit"
+                );
+                bytes.extend_from_slice(data);
+            }
+        }
+        Ok(Reply {
+            status,
+            body: bytes.freeze(),
+        })
     }
 
     /// `call`, failing on any non-success status with the daemon's message.

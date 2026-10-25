@@ -18,6 +18,11 @@ pub struct Replication {
 }
 
 impl Replication {
+    #[cfg(all(test, not(celld_internal_tests)))]
+    pub(crate) fn native_handoff_test_replication(ltx: Arc<LtxRepl>) -> Self {
+        Self { ltx }
+    }
+
     /// See `LtxRepl::set_paged_fleet`: the fleet sampler's answer to whether
     /// every live lease reads a paged epoch.
     pub fn set_paged_fleet(&self, ready: bool) -> bool {

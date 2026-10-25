@@ -657,6 +657,21 @@ async fn restore_from_plan_inner<C: ReplicaClient>(
     })
 }
 
+/// restores one already authenticated full snapshot without a second source lookup.
+pub fn restore_certified_snapshot(
+    host: &crate::LtxHost,
+    output_path: &Path,
+    snapshot: Vec<u8>,
+) -> Result<()> {
+    ensure_restore_output_absent(host, output_path)?;
+    let image = build_database_image(&[snapshot])?;
+    if let Some(parent) = output_path.parent() {
+        host.create_dir_all(parent)?;
+    }
+    let temporary = append_ext(output_path, "tmp");
+    write_file_atomic(host, &temporary, output_path, &image)
+}
+
 /// Returns the ordered list of LTX files needed to restore the database at
 /// `txid` (`TXID(0)` = latest).
 ///

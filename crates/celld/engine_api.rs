@@ -113,6 +113,7 @@ pub struct WsTarget {
 pub enum HttpResponseWebSocket {
     Cell(WsTarget),
     Worker(WorkerWebSocket),
+    Native(Box<crate::native_ws::NativeUpgrade>),
 }
 
 pub struct HttpResponse {
@@ -628,6 +629,8 @@ pub type AlarmObserver = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot) + 
 
 #[derive(Clone)]
 pub(crate) enum StopMode {
+    /// Close an untouched inherited restore, otherwise prove a final snapshot.
+    DormantRelease,
     /// Prove the final position, then optionally retain a local base.
     ///
     /// `abandon` travels with `preserve_local` because an eviction that could

@@ -9,6 +9,93 @@
 //! because it is what JS can see.
 use super::*;
 
+// storage receivers reuse the native allocation brand and event authority.
+pub(super) fn storage_origin(
+    scope: &mut v8::PinScope,
+    receiver: v8::Local<v8::Value>,
+) -> Option<ActorEffectOrigin> {
+    let result = (|| {
+        let cell = container::allocation_authority(scope, receiver)?;
+        let context = current_reaction_or_untracked_io_context(scope)
+            .ok_or_else(|| RETIRED_EFFECT.to_string())?;
+        let origin = ActorEffectOrigin::capture(scope, &context)?
+            .ok_or_else(|| "storage requires an actor event".to_string())?;
+        if origin.cell != cell {
+            return Err("storage receiver belongs to another actor".to_string());
+        }
+        let runtime = actor_runtime_state(scope);
+        origin
+            .admit(|| retire_storage_generations(&runtime, &origin.cell, Some(&origin.owner)))??;
+        Ok(origin)
+    })();
+    match result {
+        Ok(origin) => Some(origin),
+        Err(error) => {
+            throw_storage_error(scope, "authority", error);
+            None
+        }
+    }
+}
+
+// run on the storage thread before a successor can mutate the connection.
+// cursor ids are never reused. finalisers cannot close a successor's cursor.
+pub(super) fn retire_storage_generations(
+    runtime: &ActorRuntimeState,
+    cell: &str,
+    keep: Option<&Arc<crate::native_ws::PendingUpgrades>>,
+) -> Result<(), String> {
+    let mut cursors = runtime.sql_cursor_owners.lock().unwrap();
+    cursors.retain(|id, (scope, owner, _)| {
+        let retain = scope != cell || keep.is_some_and(|keep| Arc::ptr_eq(keep, owner));
+        if !retain {
+            storage::sql_cursor_close(*id);
+        }
+        retain
+    });
+    drop(cursors);
+    let transaction = runtime
+        .storage_transactions
+        .lock()
+        .unwrap()
+        .get(cell)
+        .cloned();
+    if let Some(owner) = transaction {
+        if keep.is_none_or(|keep| !Arc::ptr_eq(keep, &owner)) {
+            retire_storage_transaction(runtime, cell, &owner)?;
+        }
+    }
+    let mut pending = runtime.pending_puts.lock().unwrap();
+    if pending
+        .get(cell)
+        .is_some_and(|batch| keep.is_none_or(|keep| !Arc::ptr_eq(keep, &batch.owner)))
+    {
+        pending.remove(cell);
+    }
+    Ok(())
+}
+
+// the recorded owner, not a scope supplied by old javascript, owns cleanup.
+// callers run on the storage thread before successor access.
+pub(super) fn retire_storage_transaction(
+    runtime: &ActorRuntimeState,
+    cell: &str,
+    retired: &Arc<crate::native_ws::PendingUpgrades>,
+) -> Result<(), String> {
+    let mut transactions = runtime.storage_transactions.lock().unwrap();
+    if !transactions
+        .get(cell)
+        .is_some_and(|owner| Arc::ptr_eq(owner, retired))
+    {
+        return Ok(());
+    }
+    if retired.generation().is_live() {
+        return Err("cannot retire a live storage transaction".to_string());
+    }
+    storage::rollback_retired_transaction(cell)?;
+    transactions.remove(cell);
+    Ok(())
+}
+
 pub(super) fn op_storage_get(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -58,12 +145,18 @@ pub(super) fn op_storage_put(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let s = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let s = &origin.cell;
     let k = args.get(1).to_rust_string_lossy(scope);
     let Some(value) = serialize_storage_value(scope, args.get(2)) else {
         return;
     };
-    if let Err(error) = storage::put_serialized(&s, &k, &value) {
+    if let Err(error) = origin
+        .admit(|| storage::put_serialized(s, &k, &value).map_err(|error| error.to_string()))
+        .and_then(|result| result)
+    {
         throw_storage_error(scope, "put", error);
     }
 }
@@ -72,7 +165,10 @@ pub(super) fn op_storage_put_many(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let cell = &origin.cell;
     let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
         throw_storage_error(scope, "put", "entries must be an array");
         return;
@@ -97,7 +193,12 @@ pub(super) fn op_storage_put_many(
         };
         serialized.push((key.to_rust_string_lossy(scope), value));
     }
-    if let Err(error) = storage::put_many_serialized(&cell, &serialized) {
+    if let Err(error) = origin
+        .admit(|| {
+            storage::put_many_serialized(cell, &serialized).map_err(|error| error.to_string())
+        })
+        .and_then(|result| result)
+    {
         throw_storage_error(scope, "put", error);
     }
 }
@@ -111,13 +212,19 @@ pub(super) fn op_storage_put_serialized(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let cell = &origin.cell;
     let key = args.get(1).to_rust_string_lossy(scope);
     let Some(bytes) = view_bytes(args.get(2)) else {
         throw_storage_error(scope, "put", "serialized row must be bytes");
         return;
     };
-    if let Err(error) = storage::put_serialized(&cell, &key, &bytes) {
+    if let Err(error) = origin
+        .admit(|| storage::put_serialized(cell, &key, &bytes).map_err(|error| error.to_string()))
+        .and_then(|result| result)
+    {
         throw_storage_error(scope, "put", error);
     }
 }
@@ -129,13 +236,15 @@ pub(super) fn op_storage_queue_put_serialized(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let key = args.get(1).to_rust_string_lossy(scope);
     let Some(bytes) = view_bytes(args.get(2)) else {
         throw_storage_error(scope, "put", "serialized row must be bytes");
         return;
     };
-    queue_serialized_puts(scope, cell, vec![(key, bytes)]);
+    queue_serialized_puts(scope, &origin, vec![(key, bytes)]);
 }
 
 pub(super) fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeState> {
@@ -145,14 +254,32 @@ pub(super) fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeS
         .clone()
 }
 
-fn queue_serialized_puts(scope: &mut v8::PinScope, cell: String, entries: Vec<(String, Vec<u8>)>) {
-    actor_runtime_state(scope)
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .entry(cell)
-        .or_default()
-        .extend(entries);
+fn queue_serialized_puts(
+    scope: &mut v8::PinScope,
+    origin: &ActorEffectOrigin,
+    entries: Vec<SerializedPut>,
+) {
+    let runtime = actor_runtime_state(scope);
+    if let Err(error) = origin.admit(|| {
+        let mut pending = runtime.pending_puts.lock().unwrap();
+        // replacement cancels uncommitted work, never transfers it to the new owner.
+        if pending
+            .get(&origin.cell)
+            .is_some_and(|batch| !Arc::ptr_eq(&batch.owner, &origin.owner))
+        {
+            pending.remove(&origin.cell);
+        }
+        pending
+            .entry(origin.cell.clone())
+            .or_insert_with(|| PendingPutBatch {
+                owner: origin.owner.clone(),
+                entries: Vec::new(),
+            })
+            .entries
+            .extend(entries);
+    }) {
+        throw_storage_error(scope, "put", error);
+    }
 }
 
 pub(super) fn op_storage_queue_put(
@@ -160,12 +287,14 @@ pub(super) fn op_storage_queue_put(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let key = args.get(1).to_rust_string_lossy(scope);
     let Some(value) = serialize_storage_value(scope, args.get(2)) else {
         return;
     };
-    queue_serialized_puts(scope, cell, vec![(key, value)]);
+    queue_serialized_puts(scope, &origin, vec![(key, value)]);
 }
 
 pub(super) fn op_storage_queue_put_many(
@@ -173,7 +302,9 @@ pub(super) fn op_storage_queue_put_many(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
         throw_storage_error(scope, "put", "entries must be an array");
         return;
@@ -198,7 +329,7 @@ pub(super) fn op_storage_queue_put_many(
         };
         serialized.push((key.to_rust_string_lossy(scope), value));
     }
-    queue_serialized_puts(scope, cell, serialized);
+    queue_serialized_puts(scope, &origin, serialized);
 }
 
 pub(super) fn op_storage_flush_pending_puts(
@@ -206,23 +337,34 @@ pub(super) fn op_storage_flush_pending_puts(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    if let Err(error) = flush_pending_puts(scope, &cell) {
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let runtime = actor_runtime_state(scope);
+    if let Err(error) = origin
+        .admit(|| flush_pending_puts(&runtime, &origin))
+        .and_then(|result| result)
+    {
         throw_storage_error(scope, "put", error);
     }
 }
 
-fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String> {
-    let entries = actor_runtime_state(scope)
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .remove(cell)
-        .unwrap_or_default();
-    if entries.is_empty() {
+// called only inside origin.admit, including transaction boundaries.
+fn flush_pending_puts(
+    runtime: &ActorRuntimeState,
+    origin: &ActorEffectOrigin,
+) -> Result<(), String> {
+    let mut pending = runtime.pending_puts.lock().unwrap();
+    let Some(batch) = pending.get(&origin.cell) else {
         return Ok(());
+    };
+    if !Arc::ptr_eq(&batch.owner, &origin.owner) {
+        return Err("pending storage writes belong to a retired activation".to_string());
     }
-    storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string())
+    storage::put_many_serialized(&origin.cell, &batch.entries)
+        .map_err(|error| error.to_string())?;
+    pending.remove(&origin.cell);
+    Ok(())
 }
 
 /// `storage.sync()`: resolve once every write the cell committed before the
@@ -252,7 +394,10 @@ pub(super) fn op_storage_sync(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let cell = origin.cell.clone();
     // A promise about durability fails closed. Without a gate channel no
     // ticket can be answered, and without a running cell event nothing says
     // which cell's writes this turn made. An egress in either state leaves
@@ -265,7 +410,9 @@ pub(super) fn op_storage_sync(
         throw_storage_error(scope, "sync", "this process has no output-gate channel");
         return;
     }
-    let context = event_context(scope);
+    let Some(context) = current_reaction_or_untracked_io_context(scope) else {
+        return throw_storage_error(scope, "sync", RETIRED_EFFECT);
+    };
     let Some(frame) = current_cell_event(&context) else {
         throw_storage_error(scope, "sync", format!("{cell} has no running cell event"));
         return;
@@ -284,7 +431,10 @@ pub(super) fn op_storage_sync(
         );
         return;
     }
-    let sample = match storage::sync_sample(&cell) {
+    let sample = match origin
+        .admit(|| storage::sync_sample(&cell).map_err(|error| error.to_string()))
+        .and_then(|result| result)
+    {
         Ok(Some(sample)) => sample,
         Ok(None) => return throw_storage_error(scope, "sync", format!("{cell} is not resident")),
         Err(error) => return throw_storage_error(scope, "sync", error.to_string()),
@@ -330,14 +480,14 @@ pub(super) fn op_storage_sync(
             cell.clone(),
             celld_logic::Channel::Sync,
             sample.position,
-            Some(sample.epoch),
+            frame.epoch,
         ),
     };
     let id = asyncrt::enqueue(async move {
         egress_gate_verdict(gate)
             .await
             .map_err(|refusal| format!("storage.sync: {cell}: {refusal}"))?;
-        Ok(String::new())
+        origin.admit(String::new)
     });
     rv.set(promise_for(scope, id));
 }
@@ -347,12 +497,15 @@ pub(super) fn op_storage_cancel_pending_puts(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    actor_runtime_state(scope)
-        .pending_puts
-        .lock()
-        .expect("pending puts lock poisoned")
-        .remove(&cell);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let runtime = actor_runtime_state(scope);
+    if let Err(error) = origin
+        .admit(|| runtime.discard_pending_generation(&origin.cell, origin.owner.generation().key()))
+    {
+        throw_storage_error(scope, "cancelPendingPuts", error);
+    }
 }
 
 pub(super) fn op_sql_ingest(
@@ -360,9 +513,14 @@ pub(super) fn op_sql_ingest(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let input = args.get(1).to_rust_string_lossy(scope);
-    let out = match storage::sql_ingest(&cell, &input) {
+    let out = match origin
+        .admit(|| storage::sql_ingest(&origin.cell, &input))
+        .and_then(|result| result)
+    {
         Ok((remainder, rows_written, statement_count)) => serde_json::json!({
             "remainder": remainder,
             "rowsWritten": rows_written,
@@ -393,7 +551,10 @@ pub(super) fn op_sql_cursor_start(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let cell = &origin.cell;
     let query = args.get(1).to_rust_string_lossy(scope);
     let timing_started = (tracing::enabled!(target: "queue_timing", tracing::Level::DEBUG)
         && cell
@@ -481,7 +642,20 @@ pub(super) fn op_sql_cursor_start(
             binds[index] = rusqlite::types::Value::Blob(bytes);
         }
     }
-    let result = storage::sql_cursor_start_values(&cell, &query, &binds);
+    let receiver = args.get(0).to_rust_string_lossy(scope);
+    let runtime = actor_runtime_state(scope);
+    let result = origin
+        .admit(|| {
+            let result = storage::sql_cursor_start_values(cell, &query, &binds)?;
+            if result.0 != 0 {
+                runtime.sql_cursor_owners.lock().unwrap().insert(
+                    result.0,
+                    (origin.cell.clone(), origin.owner.clone(), receiver),
+                );
+            }
+            Ok(result)
+        })
+        .and_then(|result| result);
     if let Some(timing_started) = timing_started {
         let statement = query
             .split_ascii_whitespace()
@@ -548,7 +722,26 @@ pub(super) fn op_sql_cursor_next(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    match storage::sql_cursor_next(cursor) {
+    let Some(origin) = storage_origin(scope, args.get(1)) else {
+        return;
+    };
+    let runtime = actor_runtime_state(scope);
+    let result = origin
+        .admit(|| {
+            let mut owners = runtime.sql_cursor_owners.lock().unwrap();
+            if !owners.get(&cursor).is_some_and(|(cell, owner, _)| {
+                cell == &origin.cell && Arc::ptr_eq(owner, &origin.owner)
+            }) {
+                return Err("SQL cursor belongs to another activation".to_string());
+            }
+            let result = storage::sql_cursor_next(cursor);
+            if !matches!(result, Ok((Some(_), _))) {
+                owners.remove(&cursor);
+            }
+            result
+        })
+        .and_then(|result| result);
+    match result {
         Ok((Some(row), _)) => rv.set(sql_row_to_v8(scope, row).into()),
         Ok((None, rows_written)) => rv.set(v8::Number::new(scope, rows_written as f64).into()),
         Err(error) => throw_sql_error(scope, error),
@@ -622,7 +815,27 @@ pub(super) fn op_sql_cursor_close(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    storage::sql_cursor_close(cursor);
+    let runtime = actor_runtime_state(scope);
+    // finalisers have no originating event. they can only close this exact
+    // registered cursor while its activation is still current, never step it.
+    let owner = runtime
+        .sql_cursor_owners
+        .lock()
+        .unwrap()
+        .get(&cursor)
+        .cloned();
+    if let Some((cell, owner, receiver)) = owner {
+        let Ok(token) = args.get(1).try_cast::<v8::String>() else {
+            return;
+        };
+        if token.to_rust_string_lossy(scope) != receiver {
+            return;
+        }
+        let _ = runtime.native_activations.admit(&cell, &owner, || {
+            storage::sql_cursor_close(cursor);
+            runtime.sql_cursor_owners.lock().unwrap().remove(&cursor);
+        });
+    }
 }
 pub(super) fn op_sql_database_size(
     scope: &mut v8::PinScope,
@@ -644,9 +857,14 @@ pub(super) fn op_d1_run(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let request = args.get(1).to_rust_string_lossy(scope);
-    let out = storage::d1_run_json(&cell, &request);
+    let out = match origin.admit(|| storage::d1_run_json(&origin.cell, &request)) {
+        Ok(out) => out,
+        Err(error) => return throw_sql_error(scope, error),
+    };
     rv.set(v8::String::new(scope, &out).unwrap().into());
 }
 #[cfg(celld_internal_tests)]
@@ -709,7 +927,10 @@ pub(super) fn op_storage_transaction_control(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
+    let cell = &origin.cell;
     let action = args.get(1).to_rust_string_lossy(scope);
     let nested = args.get(2).boolean_value(scope);
     let savepoint = args.get(3).to_rust_string_lossy(scope);
@@ -723,8 +944,22 @@ pub(super) fn op_storage_transaction_control(
     // the parent, and before COMMIT/ROLLBACK it belongs to the ending scope.
     // Clearing the cell queue on rollback would also discard parent writes;
     // flushing after rollback would commit the canceled writes outside it.
-    let result = flush_pending_puts(scope, &cell)
-        .and_then(|()| storage::transaction_control(&cell, &action, nested, &savepoint));
+    let runtime = actor_runtime_state(scope);
+    let result = origin
+        .admit(|| {
+            flush_pending_puts(&runtime, &origin)?;
+            let result = storage::transaction_control(cell, &action, nested, &savepoint)?;
+            if !nested {
+                let mut transactions = runtime.storage_transactions.lock().unwrap();
+                if action == "start" {
+                    transactions.insert(cell.clone(), origin.owner.clone());
+                } else if matches!(action.as_str(), "commit" | "rollback" | "rollback_explicit") {
+                    transactions.remove(cell);
+                }
+            }
+            Ok(result)
+        })
+        .and_then(|result| result);
     if let Some(timing_started) = timing_started {
         tracing::debug!(
             target: "queue_timing",
@@ -740,7 +975,7 @@ pub(super) fn op_storage_transaction_control(
         Err(error) => throw_storage_error(scope, "transaction", error),
         // An outermost commit published a dirty alarm: register its
         // wake-entry PUT against the current event's output gate.
-        Ok(Some(at)) if at >= 0 => spawn_arm_gate(&cell, at, current_reaction_io_context(scope)),
+        Ok(Some(at)) if at >= 0 => spawn_arm_gate(cell, at, current_reaction_io_context(scope)),
         Ok(_) => {}
     }
 }
@@ -749,9 +984,14 @@ pub(super) fn op_storage_delete(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let s = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let k = args.get(1).to_rust_string_lossy(scope);
-    match storage::delete(&s, &k) {
+    match origin
+        .admit(|| storage::delete(&origin.cell, &k).map_err(|error| error.to_string()))
+        .and_then(|result| result)
+    {
         Ok(deleted) => rv.set(v8::Boolean::new(scope, deleted).into()),
         Err(error) => throw_storage_error(scope, "delete", error),
     }
@@ -761,7 +1001,9 @@ pub(super) fn op_storage_delete_many(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let keys = match storage_string_array(scope, args.get(1)) {
         Ok(keys) => keys,
         Err(error) => {
@@ -769,7 +1011,10 @@ pub(super) fn op_storage_delete_many(
             return;
         }
     };
-    match storage::delete_many(&cell, &keys) {
+    match origin
+        .admit(|| storage::delete_many(&origin.cell, &keys).map_err(|error| error.to_string()))
+        .and_then(|result| result)
+    {
         Ok(deleted) => rv.set(v8::Number::new(scope, deleted as f64).into()),
         Err(error) => throw_storage_error(scope, "delete", error),
     }
@@ -1235,9 +1480,17 @@ pub(super) fn op_storage_delete_all(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(origin) = storage_origin(scope, args.get(0)) else {
+        return;
+    };
     let delete_alarm = args.get(1).boolean_value(scope);
-    if let Err(error) = storage::delete_all_with_alarm(&cell, delete_alarm) {
+    if let Err(error) = origin
+        .admit(|| {
+            storage::delete_all_with_alarm(&origin.cell, delete_alarm)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|result| result)
+    {
         let message = v8::String::new(scope, &format!("deleteAll: {error}")).unwrap();
         let exception = v8::Exception::error(scope, message);
         scope.throw_exception(exception);

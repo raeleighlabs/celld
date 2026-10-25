@@ -1752,6 +1752,7 @@ pub(crate) fn encode_http_response(
     mut response: HttpResponse,
     ws_target: bool,
     stream_service: &Arc<HttpStreamService>,
+    native_upgrades: Option<&Arc<crate::native_ws::PendingUpgrades>>,
 ) -> Result<String, String> {
     let mut obj = serde_json::json!({
         "status": response.status,
@@ -1775,6 +1776,18 @@ pub(crate) fn encode_http_response(
             Ok(text) => obj["body"] = serde_json::Value::String(text.into()),
             Err(_) => obj["bodyBytes"] = serde_json::json!(response.body),
         }
+    }
+    if let Some(HttpResponseWebSocket::Native(connection)) = response.websocket.take() {
+        if !ws_target || response.status != 101 {
+            return Err("native WebSocket requires an upgrade response path".into());
+        }
+        let owner = native_upgrades.ok_or("native WebSocket response has no request owner")?;
+        let id = crate::ws_registry::ws_next_id();
+        owner
+            .reserve(id)
+            .and_then(|reservation| reservation.complete(*connection))
+            .map_err(|error| error.to_string())?;
+        obj["wsNative"] = serde_json::json!(id);
     }
     Ok(obj.to_string())
 }

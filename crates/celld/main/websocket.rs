@@ -77,7 +77,7 @@ async fn dispatch_ws_message(
         }
     }
     let Routed { request, route } = app
-        .websocket_request(socket.cell().to_string(), ws_id)
+        .websocket_request(socket.cell().to_string(), celld::js::ws_admission_id(ws_id))
         .await
         .map_err(|error| anyhow::anyhow!("route WebSocket {scope}: {error:?}"))?;
     anyhow::ensure!(route == Route::Local, "WebSocket owner moved off node");
@@ -195,7 +195,7 @@ async fn dispatch_ws_closed(
 ) -> anyhow::Result<()> {
     let scope = socket.scope();
     let Routed { request, route } = app
-        .websocket_request(socket.cell().to_string(), ws_id)
+        .websocket_request(socket.cell().to_string(), celld::js::ws_admission_id(ws_id))
         .await
         .map_err(|error| anyhow::anyhow!("route WebSocket close {scope}: {error:?}"))?;
     anyhow::ensure!(route == Route::Local, "WebSocket owner moved off node");
@@ -332,6 +332,7 @@ pub(super) async fn refuse_websocket_without_upgrade(
 /// so dropping an unfinished response cannot leave host state behind.
 enum PendingWebSocket {
     Worker(celld::js::websocket::WorkerWebSocket),
+    Native(Box<celld::native_ws::NativeUpgrade>),
     Cell(celld::js::WsTarget),
     Tunnel {
         target: celld::js::WsTarget,
@@ -343,6 +344,13 @@ impl PendingWebSocket {
     fn new(websocket: HttpResponseWebSocket) -> anyhow::Result<Self> {
         Ok(match websocket {
             HttpResponseWebSocket::Worker(worker) => Self::Worker(worker),
+            HttpResponseWebSocket::Native(connection) => {
+                anyhow::ensure!(
+                    !connection.lease.revocation().is_cancelled(),
+                    "native WebSocket owner was revoked"
+                );
+                Self::Native(connection)
+            }
             HttpResponseWebSocket::Cell(target) => match target.tunnel {
                 Some(parked) => Self::Tunnel {
                     target,
@@ -355,7 +363,7 @@ impl PendingWebSocket {
 
     fn target(&self) -> Option<&celld::js::WsTarget> {
         match self {
-            Self::Worker(_) => None,
+            Self::Worker(_) | Self::Native(_) => None,
             Self::Cell(target) => Some(target),
             Self::Tunnel { target, .. } => Some(target),
         }
@@ -374,21 +382,27 @@ enum OutboundWebSocketSink {
 }
 
 impl OutboundWebSocketSink {
-    async fn open(&self, websocket: u64, protocol: String) -> anyhow::Result<()> {
+    async fn open(&self, websocket: u64, protocol: String, admitted: bool) -> anyhow::Result<()> {
         match self {
             Self::Cell { app, socket } => {
                 let cell = socket.cell();
-                let Routed { request, route } = app
-                    .request(cell.to_string())
-                    .await
+                let routed = if admitted {
+                    app.websocket_request(cell.to_string(), celld::js::ws_admission_id(websocket))
+                        .await
+                } else {
+                    app.request(cell.to_string()).await
+                };
+                let Routed { request, route } = routed
                     .map_err(|error| anyhow::anyhow!("route outbound WebSocket: {error:?}"))?;
                 anyhow::ensure!(
                     route == Route::Local,
                     "outbound WebSocket cell moved off node"
                 );
                 let _activity = app.activity(request, cell.to_string());
-                app.websocket_opened(cell.to_string(), websocket, WebSocketKind::Outbound)
-                    .await?;
+                if !admitted {
+                    app.websocket_opened(cell.to_string(), websocket, WebSocketKind::Outbound)
+                        .await?;
+                }
                 let runtime = app.runtime.as_ref().context("no cell runtime")?;
                 let answer = match socket {
                     SocketRoute::Cell(cell) => {
@@ -404,7 +418,7 @@ impl OutboundWebSocketSink {
                             .await
                     }
                 };
-                if answer.is_err() {
+                if answer.is_err() && !admitted {
                     app.websocket_closed(cell.to_string(), websocket);
                 }
                 answer
@@ -432,12 +446,15 @@ impl OutboundWebSocketSink {
         code: u16,
         reason: String,
         was_clean: bool,
+        admitted: bool,
     ) -> anyhow::Result<()> {
         match self {
             Self::Cell { app, socket } => {
                 let result =
                     dispatch_ws_closed(app, socket, websocket, code, reason, was_clean).await;
-                app.websocket_closed(socket.cell().to_string(), websocket);
+                if !admitted {
+                    app.websocket_closed(socket.cell().to_string(), websocket);
+                }
                 result
             }
             Self::Isolate(tx) => tx
@@ -496,6 +513,7 @@ async fn local_websocket_pipe(
     let _ = reply.send(Ok(celld::js::OutboundWsOpen {
         protocol: None,
         declined: None,
+        connection: None,
     }));
     // Set only by a close the caller sent. A close from the cell needs no
     // entry here: the isolate that sent it has already told the cell's own
@@ -566,9 +584,14 @@ pub(crate) async fn outbound_websocket_task(
         pull,
         headers,
         want_response,
+        connection,
+        cancel,
+        owner_cancel,
+        mut native_closed,
+        registration: _registration,
         target,
         facet,
-        reply,
+        mut reply,
     } = request;
     if let Some(target) = target {
         return local_websocket_pipe(app, id, target, pull, reply).await;
@@ -576,13 +599,74 @@ pub(crate) async fn outbound_websocket_task(
     let sink = match pull {
         Some(pull) => OutboundWebSocketSink::Isolate(pull),
         None => OutboundWebSocketSink::Cell {
-            app: Box::new(app),
-            socket: match facet {
-                Some(facet) => SocketRoute::Facet { scope, facet },
-                None => SocketRoute::Cell(scope),
+            app: Box::new(app.clone()),
+            socket: match facet.clone() {
+                Some(facet) => SocketRoute::Facet {
+                    scope: scope.clone(),
+                    facet,
+                },
+                None => SocketRoute::Cell(scope.clone()),
             },
         },
     };
+    let cancel = cancel.unwrap_or_default();
+    let owner = owner_cancel.unwrap_or_default();
+    let (connection, mut lease) = match connection {
+        Some(native) => (Some(native.connection), Some(native.lease)),
+        None => (None, None),
+    };
+    if want_response {
+        let admitted = celld::asyncrt::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = reply.closed() => return Ok(()),
+            result = celld::native_ws::NativeLease::admit(&app, id, &scope, facet.clone(),
+                owner.clone()) => result,
+        };
+        match admitted {
+            Ok(admitted) => lease = Some(admitted),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        }
+    }
+    let revoked = lease
+        .as_ref()
+        .map(|lease| lease.revocation())
+        .unwrap_or_default();
+    let core_cell = match &sink {
+        OutboundWebSocketSink::Cell { socket, .. } => socket.cell(),
+        _ => "",
+    };
+    let origin_admitted = lease
+        .as_ref()
+        .is_some_and(|lease| lease.owns(core_cell, &owner));
+    // a different actor consuming a transferred transport needs its own
+    // admission as well. both generations must remain live until close.
+    let consumer_lease = if let Some(origin) = lease.as_ref().filter(|_| !want_response) {
+        let result = celld::asyncrt::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = revoked.cancelled() => return Ok(()),
+            _ = reply.closed() => return Ok(()),
+            result = origin.admit_consumer(
+                &app, id, &scope, facet, owner.clone()
+            ) => result,
+        };
+        match result {
+            Ok(admission) => admission,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let consumer_revoked = consumer_lease
+        .as_ref()
+        .map(|lease| lease.revocation())
+        .unwrap_or_else(|| owner.revocation());
+    let admitted = origin_admitted || consumer_lease.is_some();
     let mut handshake = HeaderMap::new();
     for (name, value) in &headers {
         if matches!(
@@ -592,6 +676,7 @@ pub(crate) async fn outbound_websocket_task(
                 | "sec-websocket-key"
                 | "sec-websocket-version"
                 | "sec-websocket-protocol"
+                | "sec-websocket-extensions"
                 | "host"
         ) {
             continue;
@@ -612,7 +697,23 @@ pub(crate) async fn outbound_websocket_task(
         );
     }
     let timeout = std::time::Duration::from_secs(10);
-    let connected = tokio::time::timeout(timeout, celld::ws_client::connect(&url, handshake)).await;
+    let connected = celld::asyncrt::select! {
+        _ = cancel.cancelled() => return Ok(()),
+        _ = revoked.cancelled() => return Ok(()),
+        _ = consumer_revoked.cancelled() => {
+            if let Some(ended) = native_closed.take() {
+                let _ = ended.send(celld::native_ws::NativeClose { notify: false, ..Default::default() });
+            }
+            return Ok(());
+        },
+        _ = reply.closed() => return Ok(()),
+        result = async {
+            match connection {
+                Some(connection) => Ok(Ok(connection)),
+                None => tokio::time::timeout(timeout, celld::ws_client::connect(&url, handshake)).await,
+            }
+        } => result,
+    };
     let connection = match connected {
         Ok(Ok(connection)) => connection,
         Ok(Err(celld::ws_client::Error::Declined(declined))) if want_response => {
@@ -633,6 +734,7 @@ pub(crate) async fn outbound_websocket_task(
             let _ = reply.send(Ok(celld::js::OutboundWsOpen {
                 protocol: None,
                 declined: Some(declined),
+                connection: None,
             }));
             return Ok(());
         }
@@ -648,7 +750,6 @@ pub(crate) async fn outbound_websocket_task(
             return Ok(());
         }
     };
-    let socket = connection.socket;
     let protocol = connection
         .headers
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -664,13 +765,38 @@ pub(crate) async fn outbound_websocket_task(
         return Ok(());
     }
 
+    if want_response {
+        // the response owns the unopened transport. do not dispatch an open
+        // event or register an output sender before accept or native transfer.
+        let _ = reply.send(Ok(celld::js::OutboundWsOpen {
+            protocol,
+            declined: None,
+            connection: Some(celld::native_ws::NativeUpgrade {
+                connection,
+                lease: lease.take().context("native upgrade has no admission")?,
+            }),
+        }));
+        return Ok(());
+    }
+    let socket = connection.socket;
     let (outbound, mut outputs) = mpsc::unbounded_channel();
     sink.register(id);
     celld::js::ws_register(id, outbound);
-    if let Err(error) = sink
-        .open(id, protocol.as_deref().unwrap_or_default().to_string())
-        .await
-    {
+    let opened = celld::asyncrt::select! {
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("WebSocket request ended")),
+        _ = revoked.cancelled() => Err(anyhow::anyhow!("WebSocket owner activation ended")),
+        _ = consumer_revoked.cancelled() => Err(anyhow::anyhow!("WebSocket consumer activation ended")),
+        result = sink.open(id, protocol.as_deref().unwrap_or_default().to_string(), admitted) => result,
+    };
+    if let Err(error) = opened {
+        if consumer_revoked.is_cancelled() {
+            if let Some(ended) = native_closed.take() {
+                let _ = ended.send(celld::native_ws::NativeClose {
+                    notify: false,
+                    ..Default::default()
+                });
+            }
+        }
         celld::js::ws_unregister(id);
         let _ = reply.send(Err(error));
         return Ok(());
@@ -679,12 +805,21 @@ pub(crate) async fn outbound_websocket_task(
         .send(Ok(celld::js::OutboundWsOpen {
             protocol,
             declined: None,
+            connection: None,
         }))
         .is_err()
     {
-        let _ = sink
-            .closed(id, 1006, "opening event was cancelled".into(), false)
-            .await;
+        if native_closed.is_none() {
+            let _ = sink
+                .closed(
+                    id,
+                    1006,
+                    "opening event was cancelled".into(),
+                    false,
+                    admitted,
+                )
+                .await;
+        }
         celld::js::ws_unregister(id);
         return Ok(());
     }
@@ -694,14 +829,55 @@ pub(crate) async fn outbound_websocket_task(
     // replies on the same socket, so nothing about that changes here.
     let (close, _writer) = {
         let sink = &sink;
-        pump_cell_socket(socket, &mut outputs, true, move |data| {
+        let pumping = pump_cell_socket(socket, &mut outputs, true, move |data| {
             sink.message(id, data)
-        })
-        .await
+        });
+        celld::asyncrt::select! {
+            _ = cancel.cancelled() => {
+                if native_closed.is_none() {
+                    let _ = sink.closed(id, 1006, "request ended".into(), false, admitted).await;
+                }
+                celld::js::ws_unregister(id);
+                return Ok(());
+            }
+            _ = revoked.cancelled() => {
+                // the existing continuation notifies a live consumer, never
+                // a newly routed event in a replacement actor.
+                if consumer_revoked.is_cancelled() {
+                    if let Some(ended) = native_closed.take() {
+                        let _ = ended.send(celld::native_ws::NativeClose { notify: false, ..Default::default() });
+                    }
+                }
+                celld::js::ws_unregister(id);
+                return Ok(());
+            }
+            _ = consumer_revoked.cancelled() => {
+                if let Some(ended) = native_closed.take() {
+                    let _ = ended.send(celld::native_ws::NativeClose { notify: false, ..Default::default() });
+                }
+                celld::js::ws_unregister(id);
+                return Ok(());
+            }
+            result = pumping => result,
+        }
     };
-    let _ = sink
-        .closed(id, close.state.0, close.state.1, close.state.2)
-        .await;
+    if let Some(ended) = native_closed.take() {
+        // native close listeners run only in the existing consumer context.
+        // worker pull readers receive the same close before their sender drops.
+        if let OutboundWebSocketSink::Isolate(pull) = &sink {
+            let _ = pull.send_close(close.state.0, close.state.1.clone(), close.state.2);
+        }
+        let _ = ended.send(celld::native_ws::NativeClose {
+            code: close.state.0,
+            reason: close.state.1,
+            clean: close.state.2,
+            notify: !consumer_revoked.is_cancelled(),
+        });
+    } else {
+        let _ = sink
+            .closed(id, close.state.0, close.state.1, close.state.2, admitted)
+            .await;
+    }
     celld::js::ws_unregister(id);
     Ok(())
 }
@@ -1235,7 +1411,34 @@ async fn run_websocket_upgrade(
     upgrade: fastwebsockets::upgrade::UpgradeFut,
     websocket: PendingWebSocket,
 ) {
-    match (upgrade.await, websocket) {
+    let revoked = match &websocket {
+        PendingWebSocket::Native(native) => Some(native.lease.revocation()),
+        _ => None,
+    };
+    let upgraded = if let Some(revoked) = revoked {
+        let result = celld::asyncrt::select! {
+            _ = revoked.cancelled() => return,
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), upgrade) => result,
+        };
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::debug!("native WebSocket client upgrade timed out");
+                return;
+            }
+        }
+    } else {
+        upgrade.await
+    };
+    match (upgraded, websocket) {
+        (Ok(socket), PendingWebSocket::Native(connection)) => {
+            if let Err(error) = connection.run(socket).await {
+                tracing::debug!(%error, "native WebSocket passthrough ended");
+            }
+        }
+        (Err(error), PendingWebSocket::Native(_)) => {
+            tracing::debug!(%error, "native WebSocket upgrade failed");
+        }
         (Ok(socket), PendingWebSocket::Worker(worker)) => {
             worker_websocket_task(worker, socket).await;
         }
@@ -1257,6 +1460,17 @@ async fn run_websocket_upgrade(
         (Err(error), PendingWebSocket::Tunnel { .. }) => {
             eprintln!("celld tunneled WebSocket upgrade failed: {error}");
         }
+    }
+}
+
+pub(super) async fn run_response_websocket_upgrade(
+    app: AppHandle,
+    upgrade: fastwebsockets::upgrade::UpgradeFut,
+    websocket: HttpResponseWebSocket,
+) {
+    match PendingWebSocket::new(websocket) {
+        Ok(pending) => run_websocket_upgrade(app, upgrade, pending).await,
+        Err(error) => tracing::warn!(%error, "WebSocket handoff failed"),
     }
 }
 

@@ -983,6 +983,11 @@ pub(super) fn adopt_embedded_cell(
 }
 
 fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Result<Option<i64>> {
+    actor_runtime_state(tc)
+        .native_activations
+        .replace(cell, false);
+    storage_ops::retire_storage_generations(&actor_runtime_state(tc), cell, None)
+        .map_err(anyhow::Error::msg)?;
     // Every cell dispatch goes out through the host and arrives as an ordinary
     // reentrant `CellJob::Fetch`. There is no same-isolate shortcut, and there
     // will not be one.
@@ -1012,6 +1017,11 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
         // A facet of the root's own class lives in this isolate, and nothing
         // else releases it: its realm and connection would outlive the root.
         for facet in storage::embedded_facets(cell) {
+            actor_runtime_state(tc)
+                .native_activations
+                .replace(&facet, false);
+            storage_ops::retire_storage_generations(&actor_runtime_state(tc), &facet, None)
+                .map_err(anyhow::Error::msg)?;
             let source = format!("__celld.__cell.release({facet:?});");
             run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("release failed"))?;
             storage::close(&facet);
@@ -1022,6 +1032,9 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
     }
     let name = storage::get_actor_name(cell).context("read actor name")?;
     register_actor_name(tc, cell, name.as_deref())?;
+    actor_runtime_state(tc)
+        .native_activations
+        .replace(cell, true);
     Ok(storage::get_alarm(cell))
 }
 

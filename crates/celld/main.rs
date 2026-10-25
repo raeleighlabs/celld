@@ -16,8 +16,8 @@ use celld::actor::*;
 use celld::bucket::Bucket;
 use celld::cell_dispatch::{
     dispatch_call_attempt, dispatch_gate, local_dispatch_request_id, local_request_error,
-    local_response_stream, requests_websocket_upgrade, split_do_call, CallAttempt, CallPayload,
-    RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
+    local_response_stream, requests_websocket_upgrade, route_error_result, split_do_call,
+    CallAttempt, CallPayload, RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
 };
 use celld::fleet;
 use celld::generation::{
@@ -1093,7 +1093,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             .saturating_add(route_started.elapsed().as_micros() as u64);
                         timing.emit(&app, &call.scope, call.request_id, "route_error", "", "");
                     }
-                    break Err(error);
+                    break route_error_result(error);
                 }
                 CallAttempt::Local(result) => {
                     if let Some(timing) = websocket_timing.as_mut() {
@@ -2001,6 +2001,10 @@ pub(crate) enum ForwardedFetchOutcome {
         target: celld::js::WsTarget,
         headers: Vec<(String, String)>,
     },
+    NativeWebSocket {
+        connection: Box<celld::native_ws::NativeUpgrade>,
+        headers: Vec<(String, String)>,
+    },
 }
 
 pub(crate) async fn dispatch_forwarded_fetch(
@@ -2077,6 +2081,9 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     // handler that is still running.
                     abort.handler_answered();
                     let response = result?;
+                    if matches!(&response.websocket, Some(HttpResponseWebSocket::Native(_))) {
+                        anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+                    }
                     if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
                         accepted = Some(target.clone());
                         // The same object-level check as a local call, so a
@@ -2126,15 +2133,24 @@ pub(crate) async fn dispatch_forwarded_fetch(
                             )));
                         }
                     }
-                    if let Some(HttpResponseWebSocket::Cell(target)) =
-                        worker_response.websocket.take()
-                    {
-                        abort.disarm();
-                        drop(activity);
-                        return ForwardedFetchOutcome::WebSocket {
-                            target,
-                            headers: worker_response.headers,
-                        };
+                    match worker_response.websocket.take() {
+                        Some(HttpResponseWebSocket::Native(connection)) => {
+                            abort.disarm();
+                            drop(activity);
+                            return ForwardedFetchOutcome::NativeWebSocket {
+                                connection,
+                                headers: worker_response.headers,
+                            };
+                        }
+                        Some(HttpResponseWebSocket::Cell(target)) => {
+                            abort.disarm();
+                            drop(activity);
+                            return ForwardedFetchOutcome::WebSocket {
+                                target,
+                                headers: worker_response.headers,
+                            };
+                        }
+                        other => worker_response.websocket = other,
                     }
                     let body_active = worker_response.stream.is_some();
                     activity.set_phase("response_body", true, body_active);
@@ -2172,10 +2188,10 @@ pub(crate) async fn dispatch_forwarded_fetch(
             );
             stale
         }
-        Err(error) => response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("route failed: {error:?}"),
-        ),
+        Err(error) => match route_error_result(anyhow::Error::new(RoutedRequestError(error))) {
+            Ok(reply) => reply_without_upgrade(&app, reply, preserve_representation_length).await,
+            Err(error) => response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        },
     };
     ForwardedFetchOutcome::Reply(peer_response(result))
 }
@@ -4174,6 +4190,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     )
     .await?;
     let process_generation = actor.lease_spec.generation.clone();
+    if let Ownership::Bucket(ownership) = &actor.ownership {
+        celld::native_handoff::install(ownership.clone())?;
+    }
     let ownership_name = actor.ownership.name();
     // Keep the fleet reader beside the readiness task before the actor moves
     // to its isolated thread. Both handles share the same lease adapter, so
@@ -4584,8 +4603,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 // flight for a long time, and the densest node is the only
                 // donor. Plan around it with the rest of the batch.
                 let status = app.drain_status().await;
-                let in_flight =
-                    status.quiescing + status.evicting + status.releasing + status.adopting;
+                let in_flight = status.quiescing
+                    + status.evicting
+                    + status.retiring_dormant
+                    + status.releasing
+                    + status.adopting;
                 if in_flight >= DEFAULT_REBALANCE_BATCH_CELLS {
                     continue;
                 }
@@ -5230,15 +5252,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 }
             }
             let core_drained = status.is_some_and(|status| match shutdown_mode {
-                ShutdownMode::Handoff => {
-                    status.occupied == 0
-                        && status.activating == 0
-                        && status.quiescing == 0
-                        && status.evicting == 0
-                        && status.releasing == 0
-                        && status.adopting == 0
+                ShutdownMode::Handoff => status.handoff_complete(),
+                ShutdownMode::Preserve => {
+                    status.activating == 0 && status.evicting == 0 && status.retiring_dormant == 0
                 }
-                ShutdownMode::Preserve => status.activating == 0 && status.evicting == 0,
             });
             let completely_drained = match shutdown_mode {
                 ShutdownMode::Handoff => core_drained,
@@ -5421,6 +5438,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 activating = status.activating,
                 quiescing = status.quiescing,
                 evicting = status.evicting,
+                retiring_dormant = status.retiring_dormant,
                 releasing = status.releasing,
                 adopting = status.adopting,
                 handed_off = status.handed_off,

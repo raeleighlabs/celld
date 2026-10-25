@@ -366,7 +366,10 @@ pub(super) fn op_ws_upgrade(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    let cell = args.get(1).to_rust_string_lossy(scope);
+    let context = event_context(scope);
+    let cell = current_cell_event(&context)
+        .map(|event| event.storage)
+        .unwrap_or_default();
     let facet = match dialing_facet(scope, &cell) {
         Ok(facet) => facet,
         Err(error) => return loader_throw(scope, &error),
@@ -389,12 +392,15 @@ pub(super) fn op_ws_upgrade(
         .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
         .map(|(_, value)| value.split(',').map(|p| p.trim().to_string()).collect())
         .unwrap_or_default();
-    let pull = cell.is_empty().then(|| {
-        let (pull_tx, pull_rx) = ws_pull_channel();
-        ws_pull_register(id, pull_rx);
-        ws_track_request_socket(id);
-        pull_tx
-    });
+    let reservation = match context.native_upgrades().reserve(id) {
+        Ok(reservation) => reservation,
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    let cancel = Some(reservation.cancel.clone());
+    let owner_cancel = context
+        .native_actor_upgrades
+        .get()
+        .map(|owner| owner.generation());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = outbound_ws_tx().is_some_and(|sender| {
         sender
@@ -403,9 +409,14 @@ pub(super) fn op_ws_upgrade(
                 id,
                 url,
                 protocols,
-                pull,
+                pull: None,
                 headers,
                 want_response: true,
+                connection: None,
+                cancel,
+                owner_cancel,
+                native_closed: None,
+                registration: None,
                 target: None,
                 facet,
                 reply: tx,
@@ -429,14 +440,234 @@ pub(super) fn op_ws_upgrade(
                 "body": declined.body,
             })
             .to_string(),
-            None => serde_json::json!({
-                "upgraded": true,
-                "protocol": open.protocol.unwrap_or_default(),
-            })
-            .to_string(),
+            None => {
+                let connection = open.connection.ok_or("upgrade has no native transport")?;
+                reservation
+                    .complete(connection)
+                    .map_err(|error| error.to_string())?;
+                serde_json::json!({
+                    "upgraded": true,
+                    "protocol": open.protocol.unwrap_or_default(),
+                })
+                .to_string()
+            }
         })
     });
     rv.set(promise_for(scope, async_id));
+}
+
+pub(super) fn op_ws_release_native(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    event_context(scope).native_upgrades().remove(id);
+}
+
+pub(super) fn op_ws_native_generation(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let table = event_context(scope).native_upgrades();
+    let runtime = actor_runtime_state(scope);
+    if !table.generation().is_live()
+        || (!cell.is_empty() && !runtime.native_activations.authorises(&cell, &table))
+    {
+        // constructing an http-only actor need not acquire native resources.
+        // an actual websocket operation always requires the strict claim.
+        if args.get(1).is_true() {
+            return;
+        }
+        return loader_throw(
+            scope,
+            "native WebSocket actor generation is not owned by this event",
+        );
+    }
+    rv.set(
+        v8::String::new(scope, table.generation().key())
+            .unwrap()
+            .into(),
+    );
+}
+
+pub(super) fn op_ws_native_generation_live(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let key = args.get(1).to_rust_string_lossy(scope);
+    let live = if cell.is_empty() {
+        let owner = event_context(scope).native_upgrades().generation();
+        owner.is_live() && owner.key() == key
+    } else {
+        actor_runtime_state(scope)
+            .native_activations
+            .matches(&cell, &key)
+    };
+    rv.set_bool(live);
+}
+
+pub(super) fn op_ws_reset_native_actor(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let key = args.get(1).to_rust_string_lossy(scope);
+    rv.set_bool(actor_runtime_state(scope).reset_actor_generation(&cell, &key));
+}
+
+pub(super) fn op_ws_track_native(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let cleanup = match event_context(scope).native_upgrades().cleanup(id) {
+        Ok(cleanup) => cleanup,
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    // only cleanup crosses a gc turn. this opaque capability cannot consume
+    // or transfer a socket and is local to the issuing isolate.
+    let runtime = actor_runtime_state(scope);
+    let token = {
+        let mut handles = runtime.native_cleanup.lock().unwrap();
+        let mut rng = asyncrt::rng("native-ws-cleanup");
+        let token = loop {
+            let token = format!(
+                "{:016x}{:016x}",
+                rand::RngCore::next_u64(&mut rng),
+                rand::RngCore::next_u64(&mut rng)
+            );
+            if !handles.contains_key(&token) {
+                break token;
+            }
+        };
+        handles.insert(token.clone(), cleanup);
+        token
+    };
+    rv.set(v8::String::new(scope, &token).unwrap().into());
+}
+
+pub(super) fn op_ws_drop_native_handle(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).to_rust_string_lossy(scope);
+    let removed = actor_runtime_state(scope)
+        .native_cleanup
+        .lock()
+        .unwrap()
+        .remove(&token);
+    drop(removed);
+}
+
+pub(super) fn op_ws_consume_native(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let context = event_context(scope);
+    let cell = current_cell_event(&context)
+        .map(|event| event.storage)
+        .unwrap_or_default();
+    let facet = match dialing_facet(scope, &cell) {
+        Ok(facet) => facet,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let connection = match context.native_upgrades().take(id) {
+        Ok(connection) => connection,
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    if connection.lease.revocation().is_cancelled() {
+        return loader_throw(scope, "WebSocket owner activation ended");
+    }
+    let protocols = connection
+        .connection
+        .headers
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let pull = if cell.is_empty() {
+        let (sender, receiver) = ws_pull_channel();
+        ws_pull_register(id, receiver);
+        context.sockets.lock().unwrap().push(id);
+        context
+            .native_socket_cancels
+            .lock()
+            .unwrap()
+            .push(cancel.clone());
+        Some(sender)
+    } else {
+        None
+    };
+    let origin_cell = facet
+        .as_ref()
+        .map_or(cell.as_str(), |facet| facet.root.as_str());
+    let consumer_owner = context.native_upgrades().generation();
+    let origin_owned = connection.lease.owns(origin_cell, &consumer_owner);
+    let admission_id = connection.lease.admission_id();
+    // accept is synchronous, so sends immediately after it must have a queue
+    // even before the existing outbound task resumes this transport.
+    ws_register_outbound(id, &cell, facet.clone());
+    if origin_owned {
+        ws_link_native_admission(id, admission_id);
+    }
+    let (closed, closed_rx) = tokio::sync::oneshot::channel();
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let sent = outbound_ws_tx().is_some_and(|sender| {
+        sender
+            .send(OutboundWsReq {
+                scope: cell,
+                id,
+                url: String::new(),
+                protocols,
+                pull,
+                headers: Vec::new(),
+                want_response: false,
+                connection: Some(connection),
+                cancel: Some(cancel),
+                owner_cancel: Some(consumer_owner.clone()),
+                native_closed: Some(closed),
+                registration: (admission_id != id).then(|| WsRegistrationGuard::new(id)),
+                target: None,
+                facet,
+                reply,
+            })
+            .is_ok()
+    });
+    if !sent {
+        ws_pull_unregister(id);
+        ws_unregister(id);
+        return loader_throw(scope, "no outbound WebSocket channel");
+    }
+    let async_id = asyncrt::enqueue(async move {
+        match receive.await {
+            Ok(Ok(_)) => Ok(String::new()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(error) => Err(format!("WebSocket consume cancelled: {error}")),
+        }
+    });
+    // lifecycle notification stays in the consuming continuation. it never
+    // routes a new actor event or materialises a replacement incarnation.
+    let ended = asyncrt::enqueue_io_context(async move {
+        let close = closed_rx.await.unwrap_or_default();
+        serde_json::to_string(&close).map_err(|error| error.to_string())
+    });
+    let opening = promise_for(scope, async_id);
+    let ended = promise_for(scope, ended);
+    let result = v8::Array::new(scope, 2);
+    result.set_index(scope, 0, opening);
+    result.set_index(scope, 1, ended);
+    rv.set(result.into());
 }
 
 /// Await the next inbound event on an isolate-polled socket. Resolves with a
@@ -527,6 +758,11 @@ pub(super) fn op_ws_connect(
                 pull,
                 headers: Vec::new(),
                 want_response: false,
+                connection: None,
+                cancel: None,
+                owner_cancel: None,
+                native_closed: None,
+                registration: None,
                 target: None,
                 facet,
                 reply: tx,
@@ -602,6 +838,11 @@ pub(super) fn op_ws_bind_target(
                 pull: Some(pull_tx),
                 headers: Vec::new(),
                 want_response: false,
+                connection: None,
+                cancel: None,
+                owner_cancel: None,
+                native_closed: None,
+                registration: None,
                 target: Some(target),
                 // `scope` names the target, which keeps its own route.
                 facet: None,

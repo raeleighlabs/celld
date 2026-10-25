@@ -23,6 +23,10 @@
 //! into its engine the first time a cell of that class starts, so a node
 //! never talks to a registry.
 
+#[path = "container_allocation.rs"]
+mod allocation;
+pub use allocation::{AllocationOptions, AllocationRequest, AllocationView};
+
 use crate::asyncrt;
 use crate::docker::{frame_header, Docker, Stream};
 use anyhow::{anyhow, Context};
@@ -208,6 +212,15 @@ struct CellState {
     /// Bumped per start so a wait from a previous run cannot report for
     /// this one.
     run: u64,
+    allocation_container: Option<String>,
+    allocation_admitted: bool,
+    activation_epoch: u64,
+    activation_serial: u64,
+    activation_pending: bool,
+    startup: Option<StartupOwnership>,
+    legacy_start: Option<LegacyStart>,
+    inactivity_epoch: u64,
+    allocation_sweeper: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -223,6 +236,7 @@ pub struct CellContainer {
     name: String,
     spec: Arc<ContainerSpec>,
     state: Mutex<CellState>,
+    legacy_lifecycle: Arc<tokio::sync::Mutex<()>>,
     /// Processes `exec()` started in this container. An object drops one
     /// after `output()`; the rest go with the container.
     processes: Mutex<Vec<u64>>,
@@ -285,6 +299,139 @@ impl CellContainer {
     }
 }
 
+#[derive(Clone)]
+pub struct ContainerActivation {
+    cell: Arc<CellContainer>,
+    epoch: u64,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LegacyStart {
+    serial: u64,
+    run: u64,
+}
+
+#[derive(Clone)]
+struct StartupOwnership {
+    epoch: u64,
+    serial: u64,
+    native: bool,
+    allocation: Option<String>,
+    legacy_target: Option<String>,
+    legacy_start: Option<LegacyStart>,
+    legacy_start_pending: bool,
+}
+
+pub struct PendingContainerActivation {
+    engine: Arc<ContainerEngine>,
+    activation: ContainerActivation,
+    legacy_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    inserted: bool,
+    committed: bool,
+}
+
+impl PendingContainerActivation {
+    pub fn commit(mut self) -> ContainerActivation {
+        let activation = self.activation.clone();
+        let _cells = self.engine.cells.lock().unwrap();
+        let mut state = activation.cell.state.lock().unwrap();
+        // startup runs no container handler. authority transfers only with the runtime handle.
+        state.activation_epoch = activation.epoch;
+        state.activation_serial = activation.serial;
+        state.activation_pending = false;
+        state.startup = None;
+        state.allocation_admitted = true;
+        state.sweeper = None;
+        if let Some(cancel) = state.allocation_sweeper.take() {
+            cancel.cancel();
+        }
+        state.inactivity_epoch = state.inactivity_epoch.wrapping_add(1);
+        drop(state);
+        self.committed = true;
+        activation
+    }
+}
+
+impl Drop for PendingContainerActivation {
+    fn drop(&mut self) {
+        let cell = &self.activation.cell;
+        let mut cells = self.engine.cells.lock().unwrap();
+        if !self.committed {
+            cell.state.lock().unwrap().activation_pending = false;
+        }
+        // observation owns no workload. retain prior authority, timers and journalled cleanup.
+        // keep recovered handles and their exit observers, even when startup did not commit.
+        // discard only a new handle with no journalled responsibility.
+        if !self.committed
+            && self.inserted
+            && self
+                .engine
+                .allocations
+                .native_scope(&cell.scope)
+                .is_ok_and(|native| !native)
+            && self
+                .engine
+                .allocations
+                .legacy_record(&cell.scope)
+                .is_ok_and(|record| record.is_none())
+            && cells
+                .get(&cell.scope)
+                .is_some_and(|current| Arc::ptr_eq(current, cell))
+        {
+            cells.remove(&cell.scope);
+        }
+        // a timer or fence may already own cleanup while attachment holds the guard.
+        // transfer that guard to the executor, never invent destruction on startup failure.
+        let cleanup = self.engine.allocations.legacy_record(&cell.scope);
+        if matches!(cleanup, Ok(Some(ref record)) if record.cleanup.is_some() && record.phase != "idle")
+        {
+            if let Some(guard) = self.legacy_guard.take() {
+                self.engine.resume_legacy_cleanup(cell.clone(), guard);
+            }
+        }
+    }
+}
+
+pub struct ContainerRelease {
+    activation: ContainerActivation,
+    run: u64,
+    mode: Release,
+    native: bool,
+    allocation: Option<String>,
+}
+
+fn verify_legacy_identity(
+    info: &Value,
+    record: &allocation::LegacyRecord,
+    node: &str,
+) -> anyhow::Result<()> {
+    let labels = &info["Config"]["Labels"];
+    anyhow::ensure!(
+        record.target.is_some()
+            && info["Id"].as_str() == record.target.as_deref()
+            && info["Name"].as_str()
+                == Some(format!("/{}", container_name(node, &record.scope)).as_str())
+            && labels["celld.node"].as_str() == Some(node)
+            && labels["celld.cell"].as_str() == Some(record.scope.as_str())
+            && labels["celld.class"].as_str() == Some(record.spec.class_name.as_str())
+            && labels.get("celld.allocation.attempt").is_none()
+            && labels.get("celld.allocation.id").is_none(),
+        "legacy target ownership mismatch"
+    );
+    Ok(())
+}
+
+enum LegacyOperation {
+    Start {
+        run: u64,
+        params: StartParams,
+    },
+    Destroy {
+        owner: Option<allocation::LegacyCleanup>,
+    },
+}
+
 pub struct ContainerEngine {
     /// See `Config::runtime`.
     runtime: Option<String>,
@@ -303,6 +450,13 @@ pub struct ContainerEngine {
     networks: tokio::sync::Mutex<Option<(String, String)>>,
     /// Whether this process has installed the fence on the node's bridges.
     fenced: tokio::sync::Mutex<bool>,
+    lifecycle: tokio::sync::Mutex<()>,
+    allocations: allocation::Journal,
+    allocation_slots: Arc<tokio::sync::Semaphore>,
+    legacy_slots: Arc<tokio::sync::Semaphore>,
+    allocation_wait: Duration,
+    #[cfg(test)]
+    native_ownership_for_test: Mutex<Option<Arc<crate::ownership_store::BucketOwnership>>>,
 }
 
 /// What the runtime told this module about the node: set once at start.
@@ -498,6 +652,8 @@ impl ContainerEngine {
                 }
             }
         };
+        let allocations = allocation::Journal::open(&data_dir, &node)?;
+        let docker = docker.with_response_limit(1024 * 1024);
         let engine = Self {
             docker,
             node,
@@ -509,6 +665,13 @@ impl ContainerEngine {
             cells: Mutex::new(HashMap::new()),
             networks: tokio::sync::Mutex::new(None),
             fenced: tokio::sync::Mutex::new(false),
+            lifecycle: tokio::sync::Mutex::new(()),
+            allocations,
+            allocation_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            legacy_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            allocation_wait: allocation::DEADLINE,
+            #[cfg(test)]
+            native_ownership_for_test: Mutex::new(None),
         };
         engine.reap().await?;
         Ok(engine)
@@ -519,10 +682,11 @@ impl ContainerEngine {
     }
 
     async fn reap(&self) -> anyhow::Result<()> {
+        // connect calls this before publishing the engine. attached scopes are never reaped.
+        self.allocations.check()?;
         let filters = json!({ "label": [format!("celld.node={}", self.node)] }).to_string();
         let reply = self
-            .docker
-            .expect(
+            .allocation_call(
                 "GET",
                 &format!(
                     "/containers/json?all=true&filters={}",
@@ -532,17 +696,67 @@ impl ContainerEngine {
                     )
                 ),
                 None,
-                "list containers",
             )
             .await?;
+        anyhow::ensure!(reply.status.is_success(), "container inventory unavailable");
         let list = reply.json()?;
+        anyhow::ensure!(list.is_array(), "invalid container inventory");
         for entry in list.as_array().into_iter().flatten() {
-            if let Some(id) = entry.get("Id").and_then(Value::as_str) {
-                let _ = self
-                    .docker
-                    .call("DELETE", &format!("/containers/{id}?force=true"), None)
-                    .await;
+            // allocation attempts are reconciled only by their durable journal.
+            if entry.pointer("/Labels/celld.allocation.attempt").is_some() {
+                self.allocations.validate_inventory(entry)?;
+                continue;
             }
+            if entry
+                .pointer("/Labels/celld.cell")
+                .and_then(Value::as_str)
+                .map(|scope| self.allocations.native_scope(scope))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let (Some(id), Some(scope), Some(class)) = (
+                entry["Id"].as_str(),
+                entry["Labels"]["celld.cell"].as_str(),
+                entry["Labels"]["celld.class"].as_str(),
+            ) else {
+                continue;
+            };
+            if entry["Labels"]["celld.node"].as_str() != Some(self.node.as_str())
+                || !self.allocations.owns_legacy(scope, class, id)?
+            {
+                continue;
+            }
+            if self.cell(scope).is_some() {
+                continue;
+            }
+            let Some(mut record) = self.allocations.legacy_record(scope)? else {
+                continue;
+            };
+            let observed = match self.owned_legacy(&record).await {
+                Ok(observed) => observed,
+                Err(_) => continue,
+            };
+            record.phase = "deleting".to_string();
+            self.allocations.save_legacy(&mut record)?;
+            if observed.is_some() {
+                let removed = self
+                    .allocation_call("DELETE", &format!("/containers/{id}?force=true"), None)
+                    .await;
+                if !removed
+                    .is_ok_and(|reply| reply.status.is_success() || reply.status.as_u16() == 404)
+                {
+                    tracing::warn!(
+                        event = "legacy_reaper_cleanup_unresolved",
+                        "exact-target cleanup intent retained"
+                    );
+                    continue;
+                }
+            }
+            record.phase = "idle".to_string();
+            record.target = None;
+            self.allocations.save_legacy(&mut record)?;
         }
         Ok(())
     }
@@ -678,6 +892,14 @@ impl ContainerEngine {
     /// container can reach the node's internal listener and the cloud's
     /// metadata service. The rules live in the kernel and outlive this
     /// process; a restart re-applies them, which is idempotent.
+    fn require_verified_fence(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.fenced.try_lock().is_ok_and(|fenced| *fenced),
+            "container fence is not already verified"
+        );
+        Ok(())
+    }
+
     pub async fn ensure_fence(&self) -> anyhow::Result<()> {
         let mut fenced = self.fenced.lock().await;
         if *fenced {
@@ -785,24 +1007,117 @@ impl ContainerEngine {
     /// The cell's container handle, adopting a container a previous
     /// activation on this node left running. Called at cell start for a
     /// class with a spec; the object's `running` reads the answer.
-    pub async fn attach(&self, scope: &str, class: &str) -> anyhow::Result<Arc<CellContainer>> {
+    pub async fn attach(
+        self: &Arc<Self>,
+        scope: &str,
+        class: &str,
+    ) -> anyhow::Result<Arc<CellContainer>> {
+        Ok(self.attach_activation(scope, class, 0).await?.cell)
+    }
+
+    pub async fn attach_activation(
+        self: &Arc<Self>,
+        scope: &str,
+        class: &str,
+        epoch: u64,
+    ) -> anyhow::Result<ContainerActivation> {
+        Ok(self.attach_pending(scope, class, epoch).await?.commit())
+    }
+
+    pub async fn attach_pending(
+        self: &Arc<Self>,
+        scope: &str,
+        class: &str,
+        epoch: u64,
+    ) -> anyhow::Result<PendingContainerActivation> {
+        self.allocations.check()?;
         let spec = spec(class).ok_or_else(|| anyhow!("class {class} has no container"))?;
-        let cell = {
+        let (cell, inserted, serial) = {
             let mut cells = self.cells.lock().unwrap();
+            let inserted = !cells.contains_key(scope);
             let cell = cells.entry(scope.to_string()).or_insert_with(|| {
                 Arc::new(CellContainer {
                     scope: scope.to_string(),
                     name: container_name(&self.node, scope),
                     spec,
                     state: Mutex::new(CellState::default()),
+                    legacy_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
                 })
             });
-            // A returning cell cancels the destroy its eviction armed.
-            cell.state.lock().unwrap().sweeper = None;
-            cell.clone()
+            let mut state = cell.state.lock().unwrap();
+            anyhow::ensure!(
+                !state.activation_pending,
+                "container attachment is still pending"
+            );
+            anyhow::ensure!(
+                epoch >= state.activation_epoch
+                    && state
+                        .startup
+                        .as_ref()
+                        .is_none_or(|owner| epoch >= owner.epoch),
+                "stale container attachment epoch"
+            );
+            let serial = state
+                .activation_serial
+                .checked_add(1)
+                .expect("container activation counter exhausted");
+            let legacy = self.allocations.legacy_record(scope)?;
+            // retain exact cleanup responsibility before admission can fail or be cancelled.
+            state.startup = Some(StartupOwnership {
+                epoch,
+                serial: state.activation_serial,
+                native: self.allocations.native_scope(scope)?,
+                allocation: self.allocations.active(scope)?.map(|record| record.id),
+                legacy_target: legacy.as_ref().and_then(|record| record.target.clone()),
+                legacy_start: state.legacy_start,
+                legacy_start_pending: state.legacy_start.is_some()
+                    && legacy.as_ref().is_some_and(|record| {
+                        matches!(
+                            record.phase.as_str(),
+                            "preparing" | "creating" | "starting" | "deleting"
+                        )
+                    }),
+            });
+            state.activation_pending = true;
+            (cell.clone(), inserted, serial)
         };
+        let activation = ContainerActivation {
+            cell: cell.clone(),
+            epoch,
+            serial,
+        };
+        let mut pending = PendingContainerActivation {
+            engine: self.clone(),
+            activation,
+            legacy_guard: None,
+            inserted,
+            committed: false,
+        };
+        pending.legacy_guard = Some(
+            cell.legacy_lifecycle
+                .clone()
+                .try_lock_owned()
+                .map_err(|_| anyhow!("legacy lifecycle operation is still pending"))?,
+        );
+        anyhow::ensure!(
+            self.allocations
+                .legacy_record(scope)?
+                .is_none_or(|record| record.phase != "creating"),
+            "legacy create outcome remains unresolved"
+        );
+        let _guard = asyncrt::timeout(self.allocation_wait, self.lifecycle.lock())
+            .await
+            .map_err(|_| anyhow!("container attachment deadline exceeded"))?;
+        if self.allocations.native_scope(scope)? {
+            if let Some(record) = self.allocations.active(scope)? {
+                self.observe_allocation(&cell, record).await?;
+            }
+            return Ok(pending);
+        }
+        // legacy observation owns only this cell, never the global native lifecycle lock.
+        drop(_guard);
         let running = self.inspect_running(&cell).await?;
         // A container this handle did not start, left running by an
         // earlier owner of the name: give it a run so `monitor()` has an
@@ -817,7 +1132,7 @@ impl ContainerEngine {
         state.running = running.is_some();
         state.address = running.unwrap_or_default();
         drop(state);
-        Ok(cell)
+        Ok(pending)
     }
 
     /// The cell's handle, if the cell started on this node.
@@ -829,22 +1144,30 @@ impl ContainerEngine {
     /// instance-type caps. A cell whose container is not running reserves
     /// nothing: a stopped container holds no memory, and an idle eviction
     /// stops it before the sample would count it.
+    // experimental accounting retains commitments until exact teardown, even after process exit.
     pub fn reserved_memory_bytes(&self) -> u64 {
-        self.cells
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|cell| cell.running())
-            .map(|cell| instance_memory_bytes(cell.spec.instance_type.as_deref()))
-            .sum()
+        let Ok(commitments) = self.allocations.commitments() else {
+            return u64::MAX;
+        };
+        commitments
+            .iter()
+            .map(|spec| instance_memory_bytes(spec.instance_type.as_deref()))
+            .fold(0u64, u64::saturating_add)
     }
 
     /// This node's running containers per class.
     fn running_instances_by_class(&self) -> std::collections::BTreeMap<String, u64> {
         let mut counts = std::collections::BTreeMap::new();
-        for cell in self.cells.lock().unwrap().values() {
-            if cell.running() {
-                *counts.entry(cell.spec.class_name.clone()).or_insert(0) += 1;
+        match self.allocations.commitments() {
+            Ok(commitments) => {
+                for spec in commitments {
+                    *counts.entry(spec.class_name).or_insert(0) += 1;
+                }
+            }
+            Err(_) => {
+                for spec in SPECS.read().unwrap().iter() {
+                    counts.insert(spec.class_name.clone(), u64::MAX);
+                }
             }
         }
         counts
@@ -864,13 +1187,12 @@ impl ContainerEngine {
             return Ok(());
         };
         let class = &cell.spec.class_name;
+        self.allocations.check()?;
         let here = self
-            .cells
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|other| other.running() && other.spec.class_name == *class)
-            .count() as u64;
+            .running_instances_by_class()
+            .get(class)
+            .copied()
+            .unwrap_or(0);
         let elsewhere = match &self.bucket {
             Some(bucket) => {
                 crate::ownership_store::fleet_class_instances(bucket, class, &self.node).await
@@ -878,33 +1200,55 @@ impl ContainerEngine {
             None => 0,
         };
         anyhow::ensure!(
-            here + elsewhere <= max,
+            here.saturating_add(elsewhere) <= max,
             "container class {class} is at its max_instances limit of {max}: \
              {here} on this node and {elsewhere} on other nodes",
         );
         Ok(())
     }
 
-    async fn inspect_running(&self, cell: &CellContainer) -> anyhow::Result<Option<Address>> {
+    async fn owned_legacy(
+        &self,
+        record: &allocation::LegacyRecord,
+    ) -> anyhow::Result<Option<Value>> {
+        let id = record
+            .target
+            .as_deref()
+            .ok_or_else(|| anyhow!("legacy target is not recorded"))?;
         let reply = self
-            .docker
-            .call("GET", &format!("/containers/{}/json", cell.name), None)
+            .allocation_call("GET", &format!("/containers/{id}/json"), None)
             .await?;
         if reply.status.as_u16() == 404 {
             return Ok(None);
         }
-        if !reply.status.is_success() {
-            return Err(anyhow!(
-                "inspect container failed with [{}] {}",
-                reply.status.as_u16(),
-                reply.message()
-            ));
-        }
+        anyhow::ensure!(
+            reply.status.is_success(),
+            "legacy target inspection unavailable"
+        );
         let info = reply.json()?;
+        verify_legacy_identity(&info, record, &self.node)?;
+        Ok(Some(info))
+    }
+
+    async fn inspect_running(&self, cell: &CellContainer) -> anyhow::Result<Option<Address>> {
+        let Some(record) = self.allocations.legacy_record(&cell.scope)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            record.spec.class_name == cell.spec.class_name,
+            "legacy class mismatch"
+        );
+        if record.phase != "running" || record.cleanup.is_some() {
+            return Ok(None);
+        }
+        let Some(info) = self.owned_legacy(&record).await? else {
+            return Ok(None);
+        };
         let running = info
             .pointer("/State/Running")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .ok_or_else(|| anyhow!("legacy state is unverified"))?;
+        cell.state.lock().unwrap().allocation_container = record.target;
         Ok(running.then(|| address_of(&info)))
     }
 
@@ -915,6 +1259,177 @@ impl ContainerEngine {
     /// object's `start()` returns before this completes, as on Cloudflare;
     /// a failure surfaces through `monitor()`.
     pub async fn start(
+        self: &Arc<Self>,
+        cell: &Arc<CellContainer>,
+        run: u64,
+        params: StartParams,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .legacy_request(cell, LegacyOperation::Start { run, params })
+            .await;
+        if let Err(error) = &result {
+            let mut state = cell.state.lock().unwrap();
+            if state.run == run {
+                state.running = false;
+                state.address = Address::None;
+                cell.exit
+                    .send_replace(Some((run, Err(format!("{error:#}")))));
+            }
+        }
+        result
+    }
+
+    async fn legacy_request(
+        self: &Arc<Self>,
+        cell: &Arc<CellContainer>,
+        operation: LegacyOperation,
+    ) -> anyhow::Result<()> {
+        let mut permit = if matches!(&operation, LegacyOperation::Start { .. }) {
+            Some(
+                self.legacy_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| anyhow!("legacy operation admission is full"))?,
+            )
+        } else {
+            None
+        };
+        let guard = {
+            let cells = self.cells.lock().unwrap();
+            anyhow::ensure!(
+                cells
+                    .get(&cell.scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, cell)),
+                "legacy cell is detached"
+            );
+            if let LegacyOperation::Destroy { owner } = &operation {
+                let state = cell.state.lock().unwrap();
+                let current = allocation::LegacyCleanup {
+                    epoch: state.activation_epoch,
+                    serial: state.activation_serial,
+                    run: state.run,
+                };
+                anyhow::ensure!(
+                    owner.as_ref().is_none_or(|owner| owner == &current),
+                    "stale legacy release"
+                );
+                // this is independent of the operation lock and never erases create uncertainty.
+                self.allocations
+                    .request_legacy_cleanup(&cell.scope, current)?;
+            }
+            let guard = cell
+                .legacy_lifecycle
+                .clone()
+                .try_lock_owned()
+                .map_err(|_| {
+                    anyhow!("legacy operation is already pending; cleanup intent retained")
+                })?;
+            if matches!(&operation, LegacyOperation::Start { .. }) {
+                let mut state = cell.state.lock().unwrap();
+                anyhow::ensure!(
+                    state.allocation_admitted && !state.activation_pending,
+                    "legacy admission closed by ownership release or pending activation"
+                );
+                if let Some(cancel) = state.allocation_sweeper.take() {
+                    cancel.cancel();
+                }
+                state.inactivity_epoch = state.inactivity_epoch.wrapping_add(1);
+            }
+            let name = match &operation {
+                LegacyOperation::Start { .. } => "start",
+                LegacyOperation::Destroy { .. } => "destroy",
+            };
+            self.allocations.begin_legacy_operation(cell, name)?;
+            if let LegacyOperation::Start { run, .. } = &operation {
+                let mut state = cell.state.lock().unwrap();
+                let serial = state
+                    .legacy_start
+                    .map_or(0, |start| start.serial)
+                    .checked_add(1)
+                    .expect("legacy start counter exhausted");
+                state.legacy_start = Some(LegacyStart { serial, run: *run });
+            }
+            guard
+        };
+        // deletion intent survives aggregate admission refusal and is retryable by exact target.
+        if permit.is_none() {
+            permit = Some(
+                self.legacy_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| anyhow!("legacy cleanup admission is full; intent retained"))?,
+            );
+        }
+        let engine = self.clone();
+        let cell = cell.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // the task and durable intent outlive an interrupted javascript or runtime waiter.
+        asyncrt::spawn(async move {
+            let mut guard = Some(guard);
+            let _permit = permit;
+            let start_run = match &operation {
+                LegacyOperation::Start { run, .. } => Some(*run),
+                LegacyOperation::Destroy { .. } => None,
+            };
+            let starting = start_run.is_some();
+            let result = match operation {
+                LegacyOperation::Start { run, params } => {
+                    engine.start_legacy_owned(&cell, run, params).await
+                }
+                LegacyOperation::Destroy { .. } => engine.destroy_legacy_locked(&cell).await,
+            };
+            let mut result = match result {
+                Err(error) => engine
+                    .allocations
+                    .finish_legacy_preparation(&cell.scope)
+                    .and(Err(error)),
+                Ok(()) => Ok(()),
+            };
+            let cleanup = {
+                // closing the task and reserving cleanup share this short admission lock.
+                let _cells = engine.cells.lock().unwrap();
+                let cleanup = engine.allocations.legacy_record(&cell.scope).map(|record| {
+                    starting && record.is_some_and(|record| record.cleanup.is_some())
+                });
+                if !matches!(&cleanup, Ok(true)) {
+                    drop(guard.take());
+                }
+                cleanup
+            };
+            match cleanup {
+                Ok(true) => {
+                    result = match engine.destroy_legacy_locked(&cell).await {
+                        Ok(()) if starting => {
+                            Err(anyhow!("legacy start cancelled by retained cleanup"))
+                        }
+                        Ok(()) => result,
+                        Err(error) => Err(error),
+                    };
+                    let _cells = engine.cells.lock().unwrap();
+                    drop(guard.take());
+                }
+                Err(error) => result = Err(error),
+                Ok(false) => {}
+            }
+            if let (Some(run), Err(error)) = (start_run, &result) {
+                let mut state = cell.state.lock().unwrap();
+                if state.run == run {
+                    state.running = false;
+                    state.address = Address::None;
+                    cell.exit
+                        .send_replace(Some((run, Err(format!("{error:#}")))));
+                }
+            }
+            let _ = sender.send(result);
+        })
+        .detach();
+        asyncrt::timeout(self.allocation_wait, receiver)
+            .await
+            .map_err(|_| anyhow!("legacy operation deadline exceeded; outcome remains owned"))?
+            .map_err(|_| anyhow!("legacy operation owner stopped; intent retained"))?
+    }
+
+    async fn start_legacy_owned(
         &self,
         cell: &Arc<CellContainer>,
         run: u64,
@@ -944,6 +1459,14 @@ impl ContainerEngine {
         };
         {
             let mut state = cell.state.lock().unwrap();
+            state.running = false;
+            state.address = Address::None;
+            anyhow::ensure!(
+                self.allocations
+                    .legacy_record(&cell.scope)?
+                    .is_some_and(|record| record.cleanup.is_none()),
+                "legacy cleanup requested before publication"
+            );
             state.running = true;
             state.address = address;
         }
@@ -956,9 +1479,12 @@ impl ContainerEngine {
     fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64) {
         let docker = self.docker.clone();
         let cell_ = cell.clone();
+        let Some(target) = cell.state.lock().unwrap().allocation_container.clone() else {
+            return;
+        };
         asyncrt::spawn(async move {
             let result = docker
-                .call("POST", &format!("/containers/{}/wait", cell_.name), None)
+                .call("POST", &format!("/containers/{target}/wait"), None)
                 .await
                 .and_then(|reply| {
                     if !reply.status.is_success() {
@@ -991,21 +1517,63 @@ impl ContainerEngine {
         cell: &CellContainer,
         params: StartParams,
     ) -> anyhow::Result<Address> {
-        self.ensure_fence().await?;
-        self.enforce_instance_ceiling(cell).await?;
-        self.ensure_image(&cell.spec.image).await?;
-        let (open, internal) = self.networks().await?;
+        // this experimental path never launches helpers, imports images or changes networks.
+        self.require_verified_fence()?;
+        let (open, internal) = self
+            .networks
+            .try_lock()
+            .map_err(|_| anyhow!("legacy network preparation is unavailable"))?
+            .clone()
+            .ok_or_else(|| anyhow!("legacy networks must already be prepared"))?;
+        let image = asyncrt::timeout(self.allocation_wait, async {
+            self.enforce_instance_ceiling(cell).await?;
+            let reply = self
+                .allocation_call("GET", &format!("/images/{}/json", cell.spec.image), None)
+                .await?;
+            anyhow::ensure!(
+                reply.status.is_success(),
+                "legacy image must already be prepared"
+            );
+            let body = reply.json()?;
+            let image = body["Id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("legacy image id missing"))?;
+            anyhow::ensure!(
+                image
+                    .strip_prefix("sha256:")
+                    .is_some_and(|hex| hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))),
+                "legacy image id invalid"
+            );
+            Ok::<_, anyhow::Error>(image.to_string())
+        })
+        .await
+        .map_err(|_| anyhow!("legacy preparation deadline exceeded"))??;
         // A previous run's container may still be named: the wait task
         // observed its exit but nothing removed it, or a restart adopted a
         // stopped one. The name is the cell's, so it is ours to remove.
-        let _ = self
-            .docker
-            .call(
-                "DELETE",
-                &format!("/containers/{}?force=true", cell.name),
-                None,
-            )
-            .await;
+        // a matching name is not ownership. replacement only removes the recorded id.
+        if self
+            .allocations
+            .legacy_record(&cell.scope)?
+            .is_some_and(|record| record.target.is_some())
+        {
+            self.delete_legacy_target(cell, true).await?;
+        }
+        let body = self.create_body(cell, params, &image, &open, &internal);
+        self.legacy_create_and_start(cell, body).await
+    }
+
+    fn create_body(
+        &self,
+        cell: &CellContainer,
+        params: StartParams,
+        image: &str,
+        open: &str,
+        internal: &str,
+    ) -> Value {
         let mut env: Vec<String> = DEFAULT_ENV.iter().map(|entry| entry.to_string()).collect();
         env.push(format!("CLOUDFLARE_DURABLE_OBJECT_ID={}", cell.scope));
         env.extend(
@@ -1088,7 +1656,7 @@ impl ContainerEngine {
         host_config["Memory"] = json!(memory);
         host_config["MemorySwap"] = json!(memory);
         let mut body = json!({
-            "Image": cell.spec.image,
+            "Image": image,
             "Env": env,
             "Labels": labels,
             "HostConfig": host_config,
@@ -1096,67 +1664,94 @@ impl ContainerEngine {
         if let Some(entrypoint) = params.entrypoint {
             body["Cmd"] = json!(entrypoint);
         }
+        body
+    }
+
+    async fn legacy_create_and_start(
+        &self,
+        cell: &CellContainer,
+        body: Value,
+    ) -> anyhow::Result<Address> {
         // The daemon can answer 409 for a name whose previous container is
         // still being removed, so a fresh start after `destroy()` retries
         // briefly, as workerd's engine does.
-        let mut reply = self
-            .docker
-            .call(
+        // unlike the inherited retry policy, a conflict never authorises name deletion.
+        let mut record = {
+            // serialize the pre-dispatch transition with synchronous cleanup reservation.
+            let _state = cell.state.lock().unwrap();
+            let mut record = self
+                .allocations
+                .legacy_record(&cell.scope)?
+                .ok_or_else(|| anyhow!("legacy intent missing"))?;
+            anyhow::ensure!(
+                record.phase == "preparing" && record.target.is_none() && record.cleanup.is_none(),
+                "legacy create is not admitted or cleanup requested"
+            );
+            record.phase = "creating".to_string();
+            self.allocations.save_legacy(&mut record)?;
+            record
+        };
+        let reply = self
+            .allocation_call(
                 "POST",
                 &format!("/containers/create?name={}", cell.name),
-                Some(body.clone()),
+                Some(body),
             )
             .await?;
-        for _ in 0..20 {
-            if reply.status.as_u16() != 409 {
-                break;
-            }
-            asyncrt::sleep(Duration::from_millis(100)).await;
-            let _ = self
-                .docker
-                .call(
-                    "DELETE",
-                    &format!("/containers/{}?force=true", cell.name),
-                    None,
-                )
-                .await;
-            reply = self
-                .docker
-                .call(
-                    "POST",
-                    &format!("/containers/create?name={}", cell.name),
-                    Some(body.clone()),
-                )
-                .await?;
+        if matches!(reply.status.as_u16(), 400 | 404 | 409)
+            && reply
+                .json()
+                .ok()
+                .is_some_and(|body| body["message"].is_string())
+        {
+            record.phase = "idle".to_string();
+            self.allocations.save_legacy(&mut record)?;
+            return Err(anyhow!("legacy create was definitively rejected"));
         }
-        if reply.status.as_u16() == 404 {
-            return Err(anyhow!("No such image available named {}", cell.spec.image));
+        anyhow::ensure!(
+            reply.status.is_success(),
+            "legacy create outcome is unknown"
+        );
+        let created = reply.json()?;
+        let id = created["Id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("legacy create returned no id"))?;
+        {
+            // acknowledge this admitted operation under the startup cleanup selection lock.
+            let _state = cell.state.lock().unwrap();
+            self.allocations
+                .record_legacy(&cell.scope, &cell.spec.class_name, id)?;
         }
-        if !reply.status.is_success() {
-            return Err(anyhow!(
-                "Create container failed with [{}] {}",
-                reply.status.as_u16(),
-                reply.message()
-            ));
+        let mut record = self
+            .allocations
+            .legacy_record(&cell.scope)?
+            .ok_or_else(|| anyhow!("legacy target record missing"))?;
+        anyhow::ensure!(
+            self.owned_legacy(&record).await?.is_some(),
+            "legacy created target is absent"
+        );
+        {
+            let _state = cell.state.lock().unwrap();
+            record = self
+                .allocations
+                .legacy_record(&cell.scope)?
+                .ok_or_else(|| anyhow!("legacy target record missing"))?;
+            anyhow::ensure!(
+                record.cleanup.is_none(),
+                "legacy cleanup requested before start"
+            );
         }
-        self.docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/start", cell.name),
-                None,
-                "start container",
-            )
+        let started = self
+            .allocation_call("POST", &format!("/containers/{id}/start"), None)
             .await?;
+        anyhow::ensure!(started.status.is_success(), "legacy start is unresolved");
         let info = self
-            .docker
-            .expect(
-                "GET",
-                &format!("/containers/{}/json", cell.name),
-                None,
-                "inspect container",
-            )
+            .owned_legacy(&record)
             .await?
-            .json()?;
+            .ok_or_else(|| anyhow!("legacy started target is absent"))?;
+        record.phase = "running".to_string();
+        self.allocations.save_legacy(&mut record)?;
+        cell.state.lock().unwrap().allocation_container = record.target;
         Ok(address_of(&info))
     }
 
@@ -1176,40 +1771,132 @@ impl ContainerEngine {
         }
     }
 
-    pub async fn destroy(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
-        // Kill first so the wait task reports 137 before the removal makes
-        // the name disappear under it.
-        let _ = self
-            .docker
-            .call(
-                "POST",
-                &format!("/containers/{}/kill?signal=SIGKILL", cell.name),
-                None,
-            )
-            .await;
-        let _ = self
-            .docker
-            .call(
-                "DELETE",
-                &format!("/containers/{}?force=true", cell.name),
-                None,
-            )
-            .await;
+    pub async fn destroy(self: &Arc<Self>, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
+        self.refuse_native_legacy(cell)?;
+        self.legacy_request(cell, LegacyOperation::Destroy { owner: None })
+            .await
+    }
+
+    async fn destroy_legacy_locked(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
+        self.delete_legacy_target(cell, false).await
+    }
+
+    async fn delete_legacy_target(
+        &self,
+        cell: &CellContainer,
+        replacing: bool,
+    ) -> anyhow::Result<()> {
+        let mut record = self
+            .allocations
+            .legacy_record(&cell.scope)?
+            .ok_or_else(|| anyhow!("legacy intent missing"))?;
+        anyhow::ensure!(
+            record.phase != "creating",
+            "legacy create outcome remains unknown"
+        );
+        if let Some(id) = record.target.clone() {
+            record.phase = "deleting".to_string();
+            self.allocations.save_legacy(&mut record)?;
+            // Kill first so the wait task reports 137 before the removal makes
+            // the name disappear under it.
+            if self.owned_legacy(&record).await?.is_some() {
+                let killed = self
+                    .allocation_call(
+                        "POST",
+                        &format!("/containers/{id}/kill?signal=SIGKILL"),
+                        None,
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    killed.status.is_success() || matches!(killed.status.as_u16(), 404 | 409),
+                    "legacy kill is unresolved"
+                );
+                if self.owned_legacy(&record).await?.is_some() {
+                    let deleted = self
+                        .allocation_call("DELETE", &format!("/containers/{id}?force=true"), None)
+                        .await?;
+                    anyhow::ensure!(
+                        deleted.status.is_success() || deleted.status.as_u16() == 404,
+                        "legacy deletion is unresolved"
+                    );
+                }
+            }
+        }
+        record.target = None;
+        record.phase = if replacing { "preparing" } else { "idle" }.to_string();
+        if replacing {
+            record.spec = (*cell.spec).clone();
+        }
+        self.allocations.save_legacy(&mut record)?;
         let mut state = cell.state.lock().unwrap();
         state.running = false;
         state.address = Address::None;
+        state.allocation_container = None;
         Ok(())
     }
 
+    async fn legacy_running_target(
+        &self,
+        cell: &CellContainer,
+    ) -> anyhow::Result<allocation::LegacyRecord> {
+        self.refuse_native_legacy(cell)?;
+        {
+            let cells = self.cells.lock().unwrap();
+            anyhow::ensure!(
+                cells
+                    .get(&cell.scope)
+                    .is_some_and(|current| std::ptr::eq(&**current, cell)),
+                "legacy cell is detached"
+            );
+            anyhow::ensure!(
+                cell.state.lock().unwrap().allocation_admitted,
+                "legacy admission closed"
+            );
+        }
+        let record = self
+            .allocations
+            .legacy_record(&cell.scope)?
+            .ok_or_else(|| anyhow!("legacy ownership is not recorded"))?;
+        anyhow::ensure!(
+            record.phase == "running"
+                && record.cleanup.is_none()
+                && record.spec.class_name == cell.spec.class_name,
+            "legacy target is unresolved"
+        );
+        anyhow::ensure!(
+            self.owned_legacy(&record).await?.is_some(),
+            "legacy target is absent"
+        );
+        Ok(record)
+    }
+
     pub async fn signal(&self, cell: &Arc<CellContainer>, signal: u32) -> anyhow::Result<()> {
-        self.docker
-            .expect(
+        let _permit = self
+            .legacy_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("legacy operation admission is full"))?;
+        let _guard = cell
+            .legacy_lifecycle
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| anyhow!("legacy lifecycle is pending"))?;
+        let record = self.legacy_running_target(cell).await?;
+        let id = record
+            .target
+            .as_deref()
+            .ok_or_else(|| anyhow!("legacy target missing"))?;
+        let reply = self
+            .allocation_call(
                 "POST",
-                &format!("/containers/{}/kill?signal={signal}", cell.name),
+                &format!("/containers/{id}/kill?signal={signal}"),
                 None,
-                "signal container",
             )
             .await?;
+        anyhow::ensure!(
+            reply.status.is_success(),
+            "legacy signal outcome is unresolved"
+        );
         Ok(())
     }
 
@@ -1218,42 +1905,427 @@ impl ContainerEngine {
     /// the stop waits for that: a drain ends the process right after its
     /// last stop, and a destroy left to a detached task did not always get
     /// its two daemon calls in before the exit.
-    pub async fn release(self: &Arc<Self>, scope: &str, release: Release) {
-        let Some(cell) = self.cell(scope) else {
-            return;
-        };
-        match release {
-            Release::Keep => {
-                let window = cell
-                    .state
-                    .lock()
-                    .unwrap()
-                    .inactivity
-                    .unwrap_or(DEFAULT_INACTIVITY);
-                let engine = self.clone();
-                let cell_ = cell.clone();
-                let sweeper = asyncrt::spawn(async move {
-                    asyncrt::sleep(window).await;
-                    engine.forget(&cell_).await;
-                });
-                cell.state.lock().unwrap().sweeper = Some(sweeper);
-            }
-            Release::Destroy => self.forget(&cell).await,
-        }
+    pub fn prepare_release(
+        &self,
+        activation: &ContainerActivation,
+        mode: Release,
+    ) -> anyhow::Result<ContainerRelease> {
+        self.prepare_release_inner(activation, mode, false)
     }
 
-    async fn forget(&self, cell: &Arc<CellContainer>) {
-        let _ = self.destroy(cell).await;
-        for id in cell.processes.lock().unwrap().drain(..) {
-            drop_process(id);
+    pub(crate) fn prepare_runtime_release(
+        &self,
+        activation: &ContainerActivation,
+        mode: Release,
+    ) -> anyhow::Result<ContainerRelease> {
+        self.prepare_release_inner(activation, mode, true)
+    }
+
+    fn prepare_release_inner(
+        &self,
+        activation: &ContainerActivation,
+        mode: Release,
+        retiring: bool,
+    ) -> anyhow::Result<ContainerRelease> {
+        let cell = &activation.cell;
+        let cells = self.cells.lock().unwrap();
+        anyhow::ensure!(
+            cells
+                .get(&cell.scope)
+                .is_some_and(|current| Arc::ptr_eq(current, cell)),
+            "container activation is detached"
+        );
+        let mut state = cell.state.lock().unwrap();
+        anyhow::ensure!(
+            state.activation_serial == activation.serial
+                && state.activation_epoch == activation.epoch,
+            "stale container activation release"
+        );
+        // runtime retirement closes shared admission even when keeping the container.
+        // capturing an idle ticket alone does not retire a still-running actor.
+        if retiring || mode == Release::Destroy {
+            state.allocation_admitted = false;
         }
-        let mut cells = self.cells.lock().unwrap();
-        if cells
-            .get(&cell.scope)
-            .is_some_and(|current| Arc::ptr_eq(current, cell))
+        if mode == Release::Destroy {
+            state.inactivity_epoch = state.inactivity_epoch.wrapping_add(1);
+            if let Some(cancel) = state.allocation_sweeper.take() {
+                cancel.cancel();
+            }
+        }
+        let native = self.allocations.native_scope(&cell.scope)?;
+        let allocation = self
+            .allocations
+            .active(&cell.scope)?
+            .map(|record| record.id);
+        if mode == Release::Destroy {
+            if let Some(id) = &allocation {
+                self.request_allocation_cleanup(cell, id)?;
+            } else if !native {
+                self.allocations.request_legacy_cleanup(
+                    &cell.scope,
+                    allocation::LegacyCleanup {
+                        epoch: activation.epoch,
+                        serial: activation.serial,
+                        run: state.run,
+                    },
+                )?;
+            }
+        }
+        Ok(ContainerRelease {
+            activation: activation.clone(),
+            run: state.run,
+            mode,
+            native,
+            allocation,
+        })
+    }
+
+    /// Bind an older retained native attachment to a verified current owner
+    /// before retiring it. Never use this fallback for an unverified scope,
+    /// foreign journal, pending attachment, or newer local responsibility.
+    pub(crate) fn prepare_dormant_native_release(
+        &self,
+        scope: &str,
+        epoch: u64,
+        journal: &str,
+    ) -> anyhow::Result<Option<ContainerRelease>> {
+        anyhow::ensure!(
+            self.native_journal_identity()? == journal,
+            "dormant native retirement journal changed"
+        );
         {
+            let cells = self.cells.lock().unwrap();
+            let Some(cell) = cells.get(scope) else {
+                return Ok(None);
+            };
+            let mut state = cell.state.lock().unwrap();
+            anyhow::ensure!(
+                !state.activation_pending
+                    && state.activation_epoch <= epoch
+                    && state
+                        .startup
+                        .as_ref()
+                        .is_none_or(|owner| owner.epoch <= epoch),
+                "dormant native retirement attachment changed"
+            );
+            anyhow::ensure!(
+                self.allocations.native_scope(scope)?,
+                "dormant attachment is not native"
+            );
+            state.startup = Some(StartupOwnership {
+                epoch,
+                serial: state.activation_serial,
+                native: true,
+                allocation: self.allocations.active(scope)?.map(|record| record.id),
+                legacy_target: None,
+                legacy_start: None,
+                legacy_start_pending: false,
+            });
+            state.allocation_admitted = false;
+        }
+        self.prepare_startup_release(scope, epoch)
+    }
+
+    // failed startup retains an exact target but never gains actor authority. a fence
+    // can retire that responsibility after the runtime reports a definite failure.
+    pub fn prepare_startup_release(
+        &self,
+        scope: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Option<ContainerRelease>> {
+        let cells = self.cells.lock().unwrap();
+        let Some(cell) = cells.get(scope) else {
+            return Ok(None);
+        };
+        let mut state = cell.state.lock().unwrap();
+        let Some(owner) = state.startup.clone() else {
+            return Ok(None);
+        };
+        if owner.epoch != epoch || owner.serial != state.activation_serial {
+            return Ok(None);
+        }
+        if self.allocations.native_scope(scope)? != owner.native
+            || self.allocations.active(scope)?.map(|record| record.id) != owner.allocation
+        {
+            return Ok(None);
+        }
+        if !owner.native {
+            let legacy = self.allocations.legacy_record(scope)?;
+            let target = legacy.as_ref().and_then(|record| record.target.as_ref());
+            // only the captured admitted start may advance or replace its journalled target.
+            // a later start, even for the same run or target, has a different serial.
+            if state.legacy_start != owner.legacy_start
+                || (target != owner.legacy_target.as_ref() && !owner.legacy_start_pending)
+            {
+                return Ok(None);
+            }
+        }
+        state.allocation_admitted = false;
+        let activation = ContainerActivation {
+            cell: cell.clone(),
+            epoch: state.activation_epoch,
+            serial: state.activation_serial,
+        };
+        if let Some(id) = &owner.allocation {
+            self.request_allocation_cleanup(cell, id)?;
+        } else if !owner.native {
+            self.allocations.request_legacy_cleanup(
+                scope,
+                allocation::LegacyCleanup {
+                    epoch: activation.epoch,
+                    serial: activation.serial,
+                    run: state.run,
+                },
+            )?;
+        }
+        Ok(Some(ContainerRelease {
+            activation,
+            run: state.run,
+            mode: Release::Destroy,
+            native: owner.native,
+            allocation: owner.allocation,
+        }))
+    }
+
+    fn resume_legacy_cleanup(
+        self: &Arc<Self>,
+        cell: Arc<CellContainer>,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let engine = self.clone();
+        asyncrt::spawn(async move {
+            let _guard = guard;
+            let result = async {
+                let _permit = asyncrt::timeout(
+                    engine.allocation_wait,
+                    engine.legacy_slots.clone().acquire_owned(),
+                )
+                .await
+                .map_err(|_| anyhow!("legacy cleanup admission deadline exceeded"))??;
+                engine.destroy_legacy_locked(&cell).await
+            }
+            .await;
+            if result.is_err() {
+                tracing::warn!(
+                    event = "container_pending_cleanup_unresolved",
+                    "journalled legacy cleanup remains retryable"
+                );
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) async fn close_native_handoff(
+        self: &Arc<Self>,
+        scope: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Vec<crate::native_handoff::DestroyedAttempt>> {
+        let activation = {
+            let cells = self.cells.lock().unwrap();
+            match cells.get(scope) {
+                Some(cell) => {
+                    let state = cell.state.lock().unwrap();
+                    anyhow::ensure!(
+                        state
+                            .startup
+                            .as_ref()
+                            .is_none_or(|owner| owner.epoch == epoch),
+                        "native handoff startup epoch changed"
+                    );
+                    // Failed attachment never commits activation_epoch. Accept
+                    // its exact retired startup only with terminal evidence;
+                    // never retarget deletion to the requested newer epoch.
+                    if !state.activation_pending
+                        && !state.allocation_admitted
+                        && state.activation_epoch < epoch
+                        && state.startup.as_ref().is_some_and(|owner| {
+                            owner.native
+                                && owner.epoch == epoch
+                                && owner.serial == state.activation_serial
+                        })
+                    {
+                        return self.allocations.closed_attempts(scope);
+                    }
+                    anyhow::ensure!(
+                        !state.activation_pending && state.activation_epoch == epoch,
+                        "native handoff activation changed or remains pending"
+                    );
+                    Some(ContainerActivation {
+                        cell: cell.clone(),
+                        epoch,
+                        serial: state.activation_serial,
+                    })
+                }
+                None => None,
+            }
+        };
+        if let Some(activation) = activation {
+            let ticket = self.prepare_release(&activation, Release::Destroy)?;
+            self.release(ticket).await?;
+        }
+        // no scope-based deletion fallback: every remaining record must already be terminal.
+        self.allocations.closed_attempts(scope)
+    }
+
+    pub async fn release(self: &Arc<Self>, ticket: ContainerRelease) -> anyhow::Result<()> {
+        let cell = ticket.activation.cell.clone();
+        if ticket.mode == Release::Destroy {
+            if ticket.native {
+                if let Some(id) = ticket.allocation {
+                    let receiver = self.allocation_request(cell, AllocationRequest::Destroy(id))?;
+                    let result = receiver
+                        .await
+                        .map_err(|_| anyhow!("allocation cleanup owner stopped"))??;
+                    anyhow::ensure!(
+                        result.status == "destroyed",
+                        "allocation cleanup remains unresolved"
+                    );
+                }
+            } else {
+                self.forget(&ticket.activation, ticket.run).await?;
+            }
+            return Ok(());
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (window, epoch) = {
+            let mut state = cell.state.lock().unwrap();
+            anyhow::ensure!(
+                state.activation_serial == ticket.activation.serial
+                    && (ticket.native || state.run == ticket.run),
+                "stale idle release"
+            );
+            anyhow::ensure!(
+                self.allocations.native_scope(&cell.scope)? == ticket.native
+                    && self
+                        .allocations
+                        .active(&cell.scope)?
+                        .map(|record| record.id)
+                        == ticket.allocation,
+                "idle release no longer owns the selected attempt"
+            );
+            if let Some(old) = state.allocation_sweeper.replace(cancel.clone()) {
+                old.cancel();
+            }
+            state.inactivity_epoch = state.inactivity_epoch.wrapping_add(1);
+            (
+                state.inactivity.unwrap_or(DEFAULT_INACTIVITY),
+                state.inactivity_epoch,
+            )
+        };
+        let engine = self.clone();
+        asyncrt::spawn(async move {
+            let elapsed = futures_util::future::select(
+                Box::pin(asyncrt::sleep(window)),
+                Box::pin(cancel.cancelled()),
+            )
+            .await;
+            if !matches!(elapsed, futures_util::future::Either::Left(_)) {
+                return;
+            }
+            let result = async {
+                {
+                    let state = cell.state.lock().unwrap();
+                    if state.inactivity_epoch != epoch
+                        || state.activation_serial != ticket.activation.serial
+                    {
+                        return Ok(());
+                    }
+                    if let Some(id) = &ticket.allocation {
+                        // persist before queue admission or any await that can time out.
+                        engine.request_allocation_cleanup(&cell, id)?;
+                    }
+                }
+                if ticket.native {
+                    if let Some(id) = ticket.allocation {
+                        let receiver =
+                            engine.allocation_request(cell, AllocationRequest::Destroy(id))?;
+                        let result = receiver
+                            .await
+                            .map_err(|_| anyhow!("idle cleanup owner stopped"))??;
+                        anyhow::ensure!(
+                            result.status == "destroyed",
+                            "idle allocation cleanup remains unresolved"
+                        );
+                    }
+                } else {
+                    engine.forget(&ticket.activation, ticket.run).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if result.is_err() {
+                tracing::warn!(
+                    event = "container_idle_cleanup_unresolved",
+                    "container cleanup responsibility retained"
+                );
+            }
+        })
+        .detach();
+        Ok(())
+    }
+
+    async fn forget(
+        self: &Arc<Self>,
+        activation: &ContainerActivation,
+        run: u64,
+    ) -> anyhow::Result<()> {
+        let cell = &activation.cell;
+        {
+            let cells = self.cells.lock().unwrap();
+            anyhow::ensure!(
+                cells
+                    .get(&cell.scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, cell)),
+                "legacy activation is detached"
+            );
+            let mut state = cell.state.lock().unwrap();
+            anyhow::ensure!(
+                state.activation_serial == activation.serial
+                    && state.activation_epoch == activation.epoch
+                    && state.run == run,
+                "stale legacy release"
+            );
+            state.allocation_admitted = false;
+            self.allocations.request_legacy_cleanup(
+                &cell.scope,
+                allocation::LegacyCleanup {
+                    epoch: activation.epoch,
+                    serial: activation.serial,
+                    run,
+                },
+            )?;
+        }
+        self.legacy_request(
+            cell,
+            LegacyOperation::Destroy {
+                owner: Some(allocation::LegacyCleanup {
+                    epoch: activation.epoch,
+                    serial: activation.serial,
+                    run,
+                }),
+            },
+        )
+        .await?;
+        let mut cells = self.cells.lock().unwrap();
+        if !self.allocations.native_scope(&cell.scope)?
+            && {
+                let state = cell.state.lock().unwrap();
+                state.activation_serial == activation.serial && !state.activation_pending
+            }
+            && cells
+                .get(&cell.scope)
+                .is_some_and(|current| Arc::ptr_eq(current, cell))
+        {
+            anyhow::ensure!(
+                !cell.state.lock().unwrap().allocation_admitted,
+                "legacy admission reopened before removal"
+            );
+            for id in cell.processes.lock().unwrap().drain(..) {
+                drop_process(id);
+            }
             cells.remove(&cell.scope);
         }
+        Ok(())
     }
 
     pub async fn exec(
@@ -1261,9 +2333,28 @@ impl ContainerEngine {
         cell: &Arc<CellContainer>,
         params: ExecParams,
     ) -> anyhow::Result<Arc<ExecProcess>> {
+        anyhow::ensure!(
+            !self.allocations.native_scope(&cell.scope)?,
+            "exec is unavailable for allocation scopes"
+        );
         if !cell.running() {
             return Err(anyhow!("exec() requires a running container."));
         }
+        let _permit = self
+            .legacy_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("legacy operation admission is full"))?;
+        let _guard = cell
+            .legacy_lifecycle
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| anyhow!("legacy lifecycle is pending"))?;
+        let ownership = self.legacy_running_target(cell).await?;
+        let target = ownership
+            .target
+            .clone()
+            .ok_or_else(|| anyhow!("legacy target missing"))?;
         let mut body = json!({
             "AttachStdin": true,
             "AttachStdout": true,
@@ -1285,27 +2376,27 @@ impl ContainerEngine {
             body["User"] = json!(user);
         }
         let created = self
-            .docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/exec", cell.name),
-                Some(body),
-                "create exec",
-            )
-            .await?
-            .json()?;
+            .allocation_call("POST", &format!("/containers/{target}/exec"), Some(body))
+            .await?;
+        anyhow::ensure!(
+            created.status.is_success(),
+            "legacy exec creation is unresolved"
+        );
+        let created = created.json()?;
         let exec_id = created
             .get("Id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("exec create answered without an id"))?
             .to_string();
-        let stream = self
-            .docker
-            .hijack(
+        let stream = asyncrt::timeout(
+            self.allocation_wait,
+            self.docker.hijack(
                 &format!("/exec/{exec_id}/start"),
                 json!({ "Detach": false, "Tty": false }),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| anyhow!("legacy exec start deadline exceeded"))??;
         // Docker reports `Running: false` with no pid before it has spawned
         // the process, and a finished exec keeps its pid, so a pid of zero
         // is the one answer that means "not yet": retry it briefly, as
@@ -1314,15 +2405,13 @@ impl ContainerEngine {
         let mut pid = 0;
         for _ in 0..20 {
             let info = self
-                .docker
-                .expect(
-                    "GET",
-                    &format!("/exec/{exec_id}/json"),
-                    None,
-                    "inspect exec",
-                )
-                .await?
-                .json()?;
+                .allocation_call("GET", &format!("/exec/{exec_id}/json"), None)
+                .await?;
+            anyhow::ensure!(
+                info.status.is_success(),
+                "legacy exec inspection unavailable"
+            );
+            let info = info.json()?;
             pid = info.get("Pid").and_then(Value::as_i64).unwrap_or(0);
             if pid != 0 {
                 break;
@@ -1343,7 +2432,10 @@ impl ContainerEngine {
         let process = Arc::new(ExecProcess {
             id: next_exec_id(),
             exec_id,
-            container: cell.name.clone(),
+            container: target,
+            ownership,
+            node: self.node.clone(),
+            legacy_slots: self.legacy_slots.clone(),
             pid,
             docker: self.docker.clone(),
             stdin: tokio::sync::Mutex::new(Some(write)),
@@ -1376,6 +2468,9 @@ pub struct ExecProcess {
     pub id: u64,
     exec_id: String,
     container: String,
+    ownership: allocation::LegacyRecord,
+    node: String,
+    legacy_slots: Arc<tokio::sync::Semaphore>,
     pub pid: i64,
     docker: Docker,
     stdin: tokio::sync::Mutex<Option<WriteHalf>>,
@@ -1479,6 +2574,33 @@ impl ExecProcess {
     /// The Engine API has no exec kill, so the signal is delivered by a
     /// second exec of `kill`, as workerd does.
     pub async fn kill(&self, signal: u32) -> anyhow::Result<()> {
+        let _permit = self
+            .legacy_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("legacy operation admission is full"))?;
+        asyncrt::timeout(allocation::DEADLINE, self.kill_owned(signal))
+            .await
+            .map_err(|_| anyhow!("legacy process signal deadline exceeded"))?
+    }
+
+    async fn kill_owned(&self, signal: u32) -> anyhow::Result<()> {
+        let inspected = asyncrt::timeout(
+            allocation::DEADLINE,
+            self.docker.call_bounded(
+                "GET",
+                &format!("/containers/{}/json", self.container),
+                None,
+                1024 * 1024,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow!("legacy process target deadline exceeded"))??;
+        anyhow::ensure!(
+            inspected.status.is_success(),
+            "legacy process target unavailable"
+        );
+        verify_legacy_identity(&inspected.json()?, &self.ownership, &self.node)?;
         let body = json!({
             "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
             "Cmd": ["kill", format!("-{signal}"), self.pid.to_string()],

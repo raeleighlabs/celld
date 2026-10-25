@@ -242,9 +242,15 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 capacity_handoff: control.capacity_handoff,
             };
             let outcome = dispatch_forwarded_fetch(app.clone(), control.scope, fetch, body).await;
-            let (target, worker_headers) = match outcome {
+            let (websocket, worker_headers) = match outcome {
                 ForwardedFetchOutcome::Reply(reply) => return Ok(reply),
-                ForwardedFetchOutcome::WebSocket { target, headers } => (target, headers),
+                ForwardedFetchOutcome::WebSocket { target, headers } => {
+                    (HttpResponseWebSocket::Cell(target), headers)
+                }
+                ForwardedFetchOutcome::NativeWebSocket {
+                    connection,
+                    headers,
+                } => (HttpResponseWebSocket::Native(connection), headers),
             };
             let Some((accept, upgrade)) = client_upgrade else {
                 // `dispatch_forwarded_fetch` refuses a request without
@@ -252,25 +258,25 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 // that names the upgrade but is not a valid handshake. The
                 // socket is registered with the core by now, and the refusal
                 // must release it.
-                let refusal = super::websocket::refuse_websocket_without_upgrade(
-                    &app,
-                    HttpResponseWebSocket::Cell(target),
-                )
-                .await;
+                let refusal =
+                    super::websocket::refuse_websocket_without_upgrade(&app, websocket).await;
                 return Ok(peer_response(refusal));
             };
             // The cell accepted: hand the inner stream to the same socket
             // task a local client gets, and answer with the real 101. The
             // Worker's application headers ride along; the sidecars and
             // the hop framing die here.
-            tokio::spawn(async move {
-                match upgrade.await {
-                    Ok(socket) => super::websocket::websocket_task(app, target, socket).await,
-                    Err(error) => {
-                        eprintln!("celld tunneled upgrade failed: {error}");
-                    }
-                }
-            });
+            let task = Box::pin(super::websocket::run_response_websocket_upgrade(
+                app.clone(),
+                upgrade,
+                websocket,
+            ));
+            if app.websockets.send(task).is_err() {
+                return Ok(peer_response(response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "WebSocket executor stopped",
+                )));
+            }
             let (accept_parts, _) = accept.into_parts();
             let mut answer = Response::from_parts(
                 accept_parts,
@@ -282,6 +288,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     || lowered == "upgrade"
                     || lowered == "connection"
                     || lowered == "sec-websocket-accept"
+                    || lowered == "sec-websocket-extensions"
                 {
                     continue;
                 }
