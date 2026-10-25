@@ -55,8 +55,8 @@ not just the presence of an artefact.
 ## Releases
 
 The existing upstream tags are retained. Fork releases must use
-`v<VERSION>-grapefuit.N`, where `VERSION` matches `crates/celld/Cargo.toml` and
-`N` is a positive integer. For example, `v0.6.3-grapefuit.1`. Existing tags are
+`v<VERSION>-raeleigh-celld.N`, where `VERSION` matches `crates/celld/Cargo.toml` and
+`N` is a positive integer. For example, `v0.6.3-raeleigh-celld.1`. Existing tags are
 never moved. Use a new revision for another release.
 
 After these workflows are merged to the default branch, create a draft from
@@ -64,7 +64,7 @@ the intended source ref:
 
 ```sh
 gh workflow run release.yml --repo raeleighlabs/celld --ref main \
-  -f tag=v0.6.3-grapefuit.1
+  -f tag=v0.6.3-raeleigh-celld.1
 ```
 
 The workflow resolves the source commit, validates the tag and runs the same
@@ -76,7 +76,7 @@ It does not delete or replace an existing release.
 Publishing the draft is a separate action:
 
 ```sh
-gh release edit v0.6.3-grapefuit.1 --repo raeleighlabs/celld --draft=false
+gh release edit v0.6.3-raeleigh-celld.1 --repo raeleighlabs/celld --draft=false
 ```
 
 Publication runs the checks against the exact tagged commit again. The two
@@ -85,7 +85,7 @@ The multi-architecture manifest uses their recorded digests, rather than
 resolving mutable architecture tags. Published tags are:
 
 - `sha-<full-source-commit>`
-- `v0.6.3-grapefuit.1` and `0.6.3-grapefuit.1`, using the selected fork revision
+- `v0.6.3-raeleigh-celld.1` and `0.6.3-raeleigh-celld.1`, using the selected fork revision
 - `latest`
 
 The workflow retains image provenance and SBOMs and attests the combined image.

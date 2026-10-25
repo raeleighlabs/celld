@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Fork release tag, for example v0.6.3-grapefuit.1'
+        description: 'Fork release tag, for example v0.6.3-raeleigh-celld.1'
         required: true
         type: string
   release:
@@ -42,9 +42,9 @@ jobs:
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
-          suffix="${RELEASE_TAG#"v$version-grapefuit."}"
-          if [[ "$RELEASE_TAG" != "v$version-grapefuit.$suffix" || ! "$suffix" =~ ^[1-9][0-9]*$ ]]; then
-            echo "Use v$version-grapefuit.N with a positive fork revision; upstream tags are reserved." >&2
+          suffix="${RELEASE_TAG#"v$version-raeleigh-celld."}"
+          if [[ "$RELEASE_TAG" != "v$version-raeleigh-celld.$suffix" || ! "$suffix" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Use v$version-raeleigh-celld.N with a positive fork revision; upstream tags are reserved." >&2
             exit 1
           fi
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -105,7 +105,7 @@ jobs:
             echo "Tag already exists; choose a new fork revision." >&2
             exit 1
           fi
-          printf 'Grapefuit celld fork built from `%s`.\n\nAll native and container checks passed.\n' "$SOURCE_SHA" > notes.md
+          printf 'Raeleigh celld fork built from `%s`.\n\nAll native and container checks passed.\n' "$SOURCE_SHA" > notes.md
           gh release create "$RELEASE_TAG" --draft --target "$SOURCE_SHA" \
             --title "$RELEASE_TAG" --notes-file notes.md assets/*
 
