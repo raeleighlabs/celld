@@ -284,10 +284,15 @@ struct Fixture {
     listener: tokio::task::JoinHandle<()>,
     engine: Option<Arc<ContainerEngine>>,
     cell: Arc<CellContainer>,
+    // Deployment specs are process-wide. Hold this after all other fixture fields
+    // so parallel tests cannot replace a class while an owned operation uses it.
+    _specs_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     async fn new() -> Self {
+        static SPECS_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let specs_guard = SPECS_OWNER.lock().await;
         crate::native_ws::native_ws_tests::init_host();
         let dir = tempfile::Builder::new().prefix("alloc-").tempdir().unwrap();
         let socket = dir.path().join("d.sock");
@@ -347,6 +352,7 @@ impl Fixture {
             listener,
             engine: None,
             cell,
+            _specs_guard: specs_guard,
         };
         fixture.reopen().await.unwrap();
         fixture
