@@ -1335,11 +1335,22 @@ impl ContainerEngine {
                 }
                 state.inactivity_epoch = state.inactivity_epoch.wrapping_add(1);
             }
-            let name = match &operation {
-                LegacyOperation::Start { .. } => "start",
-                LegacyOperation::Destroy { .. } => "destroy",
-            };
-            self.allocations.begin_legacy_operation(cell, name)?;
+            match self.allocations.begin_legacy_operation(cell, &operation)? {
+                allocation::LegacyAdmission::EmptyDestroy => {
+                    let state = cell.state.lock().unwrap();
+                    anyhow::ensure!(
+                        !state.activation_pending
+                            && !state.running
+                            && state.allocation_container.is_none()
+                            && state.legacy_start.is_none(),
+                        "empty destroy contradicts container activation state"
+                    );
+                    // Consume the journal proof before releasing registry/lifecycle
+                    // admission. No daemon task or synthetic legacy intent is needed.
+                    return Ok(());
+                }
+                allocation::LegacyAdmission::Execute => {}
+            }
             if let LegacyOperation::Start { run, .. } = &operation {
                 let mut state = cell.state.lock().unwrap();
                 let serial = state

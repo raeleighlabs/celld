@@ -259,6 +259,13 @@ pub(super) struct LegacyCleanup {
     pub(super) run: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(super) enum LegacyAdmission {
+    Execute,
+    EmptyDestroy,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct LegacyRecord {
@@ -726,13 +733,23 @@ impl Journal {
     }
 
     pub(super) fn save_legacy(&self, record: &mut LegacyRecord) -> anyhow::Result<()> {
-        record.validate(&record.scope)?;
         self.check()?;
         let mut connection = self.connection.lock().unwrap();
         let tx = connection.transaction()?;
-        self.records(&tx)?;
+        self.save_legacy_in(&tx, record)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn save_legacy_in(
+        &self,
+        connection: &Connection,
+        record: &mut LegacyRecord,
+    ) -> anyhow::Result<()> {
+        record.validate(&record.scope)?;
+        self.records(connection)?;
         if let Some(current) = self
-            .legacy_records(&tx)?
+            .legacy_records(connection)?
             .into_iter()
             .find(|old| old.scope == record.scope)
         {
@@ -744,17 +761,15 @@ impl Journal {
             record.cleanup = None;
         }
         anyhow::ensure!(
-            Self::mode(&tx, &record.scope)?.as_deref() != Some("native"),
+            Self::mode(connection, &record.scope)?.as_deref() != Some("native"),
             "legacy operation refused for native scope"
         );
-        tx.execute(
+        connection.execute(
             "INSERT OR IGNORE INTO scopes VALUES (?1, 'legacy')",
             [&record.scope],
         )?;
-        tx.execute("INSERT INTO legacy_owned VALUES (?1, ?2) ON CONFLICT(scope) DO UPDATE SET body=excluded.body", params![record.scope, serde_json::to_vec(record)?])?;
-        self.seal(&tx)?;
-        tx.commit()?;
-        Ok(())
+        connection.execute("INSERT INTO legacy_owned VALUES (?1, ?2) ON CONFLICT(scope) DO UPDATE SET body=excluded.body", params![record.scope, serde_json::to_vec(record)?])?;
+        self.seal(connection)
     }
 
     pub(super) fn request_legacy_cleanup(
@@ -791,9 +806,32 @@ impl Journal {
     pub(super) fn begin_legacy_operation(
         &self,
         cell: &CellContainer,
-        operation: &str,
-    ) -> anyhow::Result<()> {
-        let mut record = self.legacy_record(&cell.scope)?.unwrap_or(LegacyRecord {
+        operation: &LegacyOperation,
+    ) -> anyhow::Result<LegacyAdmission> {
+        self.check()?;
+        let mut connection = self.connection.lock().unwrap();
+        let tx = connection.transaction()?;
+        // Absence is authoritative only in one fully validated, sealed snapshot.
+        // The caller holds the registry and per-cell lifecycle admission locks.
+        let attempts = self.records(&tx)?;
+        let legacy = self
+            .legacy_records(&tx)?
+            .into_iter()
+            .find(|record| record.scope == cell.scope);
+        let mode = Self::mode(&tx, &cell.scope)?;
+        anyhow::ensure!(
+            mode.as_deref() != Some("native"),
+            "legacy operation refused for native scope"
+        );
+        if matches!(operation, LegacyOperation::Destroy { .. }) && mode.is_none() {
+            anyhow::ensure!(
+                legacy.is_none() && !attempts.iter().any(|record| record.scope == cell.scope),
+                "unclaimed scope has container operation evidence"
+            );
+            tx.commit()?;
+            return Ok(LegacyAdmission::EmptyDestroy);
+        }
+        let mut record = legacy.unwrap_or(LegacyRecord {
             scope: cell.scope.clone(),
             spec: (*cell.spec).clone(),
             target: None,
@@ -804,7 +842,7 @@ impl Journal {
             record.spec.class_name == cell.spec.class_name,
             "legacy class mismatch"
         );
-        if operation == "start" {
+        if matches!(operation, LegacyOperation::Start { .. }) {
             anyhow::ensure!(
                 record.cleanup.is_none() && matches!(record.phase.as_str(), "idle" | "running"),
                 "legacy operation outcome remains unresolved"
@@ -825,7 +863,9 @@ impl Journal {
             }
             .to_string();
         }
-        self.save_legacy(&mut record)
+        self.save_legacy_in(&tx, &mut record)?;
+        tx.commit()?;
+        Ok(LegacyAdmission::Execute)
     }
 
     pub(super) fn finish_legacy_preparation(&self, scope: &str) -> anyhow::Result<()> {
