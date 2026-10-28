@@ -1145,6 +1145,859 @@ async fn native_handoff_dormant_retained_cleanup_waits_and_cannot_retarget_succe
 }
 
 #[tokio::test]
+async fn native_allocation_cold_scope_failed_startup_registry_cleanup_is_mode_neutral() {
+    for busy in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let scope = fixture.cell.scope.clone();
+        let class = fixture.cell.spec.class_name.clone();
+        let activation = fixture.activation();
+        let guard = if busy {
+            Some(fixture.cell.legacy_lifecycle.clone().lock_owned().await)
+        } else {
+            None
+        };
+        let pending = fixture.engine().attach_pending(&scope, &class, 2).await;
+        if busy {
+            assert_eq!(
+                pending.err().unwrap().to_string(),
+                "legacy lifecycle operation is still pending"
+            );
+        } else {
+            // Placement/storage failure drops this observation before runtime publication.
+            drop(pending.unwrap());
+        }
+        drop(guard);
+        assert_eq!(fixture.activation().epoch, activation.epoch);
+        assert_eq!(fixture.activation().serial, activation.serial);
+        assert!(fixture
+            .engine()
+            .prepare_startup_release(&scope, 3)
+            .unwrap()
+            .is_none());
+        let runtimes = crate::runtime::CellRegistry::default();
+        let cleanup = runtimes
+            .prepare_container_stop(
+                Some(fixture.engine().clone()),
+                &scope,
+                2,
+                &crate::runtime::StopMode::CloseInPlace,
+            )
+            .unwrap();
+        assert!(!fixture.cell.state.lock().unwrap().allocation_admitted);
+        tokio::time::timeout(Duration::from_secs(5), cleanup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fixture.engine().cell(&scope).is_none());
+        assert_eq!(fixture.mutation_count(), 0);
+        fixture.reopen().await.unwrap();
+        let next = fixture
+            .engine()
+            .attach_activation(&scope, &class, 3)
+            .await
+            .unwrap();
+        fixture.cell = next.cell;
+        assert_eq!(
+            fixture
+                .call(AllocationRequest::Start(
+                    fixture.options("after-startup", false)
+                ))
+                .await
+                .status,
+            "running"
+        );
+        let before = fixture.mutation_count();
+        runtimes
+            .prepare_container_stop(
+                Some(fixture.engine().clone()),
+                &scope,
+                2,
+                &crate::runtime::StopMode::CloseInPlace,
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(fixture.mutation_count(), before);
+        assert!(fixture.cell.running());
+        fixture
+            .call(AllocationRequest::Destroy("after-startup".into()))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_new_failed_startup_discards_only_unclaimed_handle() {
+    for cancelled in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let engine = fixture.engine().clone();
+        let scope = format!("{}-new-startup", fixture.cell.scope);
+        let class = fixture.cell.spec.class_name.clone();
+        assert!(engine.cell(&scope).is_none());
+        let discarded = if cancelled {
+            let guard = engine.lifecycle.lock().await;
+            let mut attaching = Box::pin(engine.attach_pending(&scope, &class, 2));
+            assert!(futures_util::poll!(attaching.as_mut()).is_pending());
+            let cell = engine.cell(&scope).unwrap();
+            assert!(cell.state.lock().unwrap().activation_pending);
+            // Cancel after insertion but before observation/commit, without a deadline sleep.
+            drop(attaching);
+            drop(guard);
+            cell
+        } else {
+            let pending = engine.attach_pending(&scope, &class, 2).await.unwrap();
+            assert!(pending.inserted);
+            let cell = pending.activation.cell.clone();
+            // A placement/storage failure drops a newly inserted, unpublished handle.
+            drop(pending);
+            cell
+        };
+        assert!(!discarded.state.lock().unwrap().activation_pending);
+        assert!(engine.cell(&scope).is_none());
+        assert!(engine.prepare_startup_release(&scope, 2).unwrap().is_none());
+        let runtimes = crate::runtime::CellRegistry::default();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtimes
+                .prepare_container_stop(
+                    Some(engine.clone()),
+                    &scope,
+                    2,
+                    &crate::runtime::StopMode::CloseInPlace,
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fixture.mutation_count(), 0);
+        assert!(!engine.native_scope(&scope).unwrap());
+        assert!(engine.allocations.legacy_record(&scope).unwrap().is_none());
+        let successor = engine.attach_activation(&scope, &class, 3).await.unwrap();
+        assert!(!Arc::ptr_eq(&successor.cell, &discarded));
+        fixture.cell = successor.cell;
+        assert_eq!(
+            fixture
+                .call(AllocationRequest::Start(
+                    fixture.options("new-startup", false)
+                ))
+                .await
+                .status,
+            "running"
+        );
+        let before = fixture.mutation_count();
+        runtimes
+            .prepare_container_stop(
+                Some(engine.clone()),
+                &scope,
+                2,
+                &crate::runtime::StopMode::CloseInPlace,
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(fixture.mutation_count(), before);
+        assert!(engine
+            .cell(&scope)
+            .is_some_and(|cell| Arc::ptr_eq(&cell, &fixture.cell)));
+        assert!(fixture.cell.running());
+        fixture
+            .call(AllocationRequest::Destroy("new-startup".into()))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_journal_admission_validates_evidence_directly() {
+    for fault in [
+        "missing-db",
+        "replaced-db",
+        "missing-marker",
+        "changed-marker",
+        "replaced-lock",
+        "bad-seal",
+        "unsealed-legacy",
+        "malformed-legacy",
+        "invalid-attempt-mac",
+        "malformed-attempt",
+    ] {
+        let fixture = Fixture::new().await;
+        let journal = &fixture.engine().allocations;
+        let operation = LegacyOperation::Destroy { owner: None };
+        assert_eq!(
+            journal
+                .begin_legacy_operation(&fixture.cell, &operation)
+                .unwrap(),
+            LegacyAdmission::EmptyDestroy
+        );
+        let dir = fixture.dir.path().join("state");
+        let path = dir.join("container-allocations.sqlite");
+        match fault {
+            "missing-db" => std::fs::rename(&path, dir.join("retained.sqlite")).unwrap(),
+            "replaced-db" => {
+                // Identical bytes are not the journal inode this executor owns.
+                std::fs::copy(&path, dir.join("replacement.sqlite")).unwrap();
+                std::fs::rename(&path, dir.join("retained.sqlite")).unwrap();
+                std::fs::rename(dir.join("replacement.sqlite"), &path).unwrap();
+            }
+            "missing-marker" => std::fs::rename(
+                dir.join("container-allocations.expected"),
+                dir.join("retained.expected"),
+            )
+            .unwrap(),
+            "changed-marker" => {
+                std::fs::rename(
+                    dir.join("container-allocations.expected"),
+                    dir.join("retained.expected"),
+                )
+                .unwrap();
+                std::fs::write(dir.join("container-allocations.expected"), b"{}").unwrap();
+            }
+            "replaced-lock" => {
+                std::fs::rename(
+                    dir.join("container-allocations.lock"),
+                    dir.join("retained.lock"),
+                )
+                .unwrap();
+                std::fs::write(dir.join("container-allocations.lock"), b"").unwrap();
+            }
+            _ => {
+                let connection = journal.connection.lock().unwrap();
+                match fault {
+                    "bad-seal" => {
+                        connection
+                            .execute("UPDATE identity SET root=X'00'", [])
+                            .unwrap();
+                    }
+                    "unsealed-legacy" | "malformed-legacy" => {
+                        connection
+                            .execute(
+                                "INSERT INTO legacy_owned VALUES ('other-scope', X'7b7d')",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                    "invalid-attempt-mac" | "malformed-attempt" => {
+                        let body = b"{}";
+                        let mac = if fault == "malformed-attempt" {
+                            journal.mac(b"allocation-record-v1", body)
+                        } else {
+                            vec![0]
+                        };
+                        connection
+                            .execute(
+                                "INSERT INTO attempts VALUES ('other-scope', 'attempt', ?1, ?2)",
+                                params![body.as_slice(), mac],
+                            )
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                if matches!(
+                    fault,
+                    "malformed-legacy" | "invalid-attempt-mac" | "malformed-attempt"
+                ) {
+                    // A valid inventory seal must not hide malformed records, even
+                    // in another scope when this scope appears empty.
+                    journal.seal(&connection).unwrap();
+                }
+            }
+        }
+        let before = std::fs::read(&path).ok();
+        // No release/forget/request-cleanup preflight can mask this helper's checks.
+        let error = journal
+            .begin_legacy_operation(&fixture.cell, &operation)
+            .unwrap_err();
+        if fault == "malformed-attempt" {
+            assert_eq!(error.to_string(), "invalid allocation record");
+            assert!(format!("{error:#}").contains("missing field `version`"));
+        } else if fault == "invalid-attempt-mac" {
+            assert_eq!(error.to_string(), "allocation record integrity failure");
+        }
+        assert_eq!(std::fs::read(&path).ok(), before, "{fault}");
+        assert_eq!(fixture.mutation_count(), 0, "{fault}");
+    }
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_idle_expiry_allows_native_reactivation() {
+    let mut fixture = Fixture::new().await;
+    let scope = fixture.cell.scope.clone();
+    fixture.cell.set_inactivity(Duration::ZERO);
+    let ticket = fixture
+        .engine()
+        .prepare_runtime_release(&fixture.activation(), Release::Keep)
+        .unwrap();
+    fixture.engine().release(ticket).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.engine().cell(&scope).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.mutation_count(), 0);
+    fixture.cell = fixture
+        .engine()
+        .attach_activation(&scope, &fixture.cell.spec.class_name, 2)
+        .await
+        .unwrap()
+        .cell;
+    assert_eq!(
+        fixture
+            .call(AllocationRequest::Start(
+                fixture.options("after-idle", false)
+            ))
+            .await
+            .status,
+        "running"
+    );
+    fixture
+        .call(AllocationRequest::Destroy("after-idle".into()))
+        .await;
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_reactivation_cancels_retained_idle_ticket() {
+    let fixture = Fixture::new().await;
+    fixture.cell.set_inactivity(Duration::from_secs(60));
+    let stale = fixture
+        .engine()
+        .prepare_release(&fixture.activation(), Release::Keep)
+        .unwrap();
+    let ticket = fixture
+        .engine()
+        .prepare_runtime_release(&fixture.activation(), Release::Keep)
+        .unwrap();
+    fixture.engine().release(ticket).await.unwrap();
+    let cancel = fixture
+        .cell
+        .state
+        .lock()
+        .unwrap()
+        .allocation_sweeper
+        .clone()
+        .unwrap();
+    fixture
+        .engine()
+        .attach_activation(&fixture.cell.scope, &fixture.cell.spec.class_name, 2)
+        .await
+        .unwrap();
+    assert!(cancel.is_cancelled());
+    assert_eq!(
+        fixture
+            .call(AllocationRequest::Start(
+                fixture.options("reactivated", false)
+            ))
+            .await
+            .status,
+        "running"
+    );
+    let before = fixture.mutation_count();
+    assert!(fixture.engine().release(stale).await.is_err());
+    assert_eq!(fixture.mutation_count(), before);
+    assert!(fixture.cell.running());
+    fixture
+        .call(AllocationRequest::Destroy("reactivated".into()))
+        .await;
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_retirement_refuses_start_waiting_on_shared_protection() {
+    use crate::native_handoff::tests::{FaultStore, PutFault, StoreGate};
+    for keep in [false, true] {
+        let mut fixture = Fixture::new().await;
+        fixture
+            .engine()
+            .attach_activation(&fixture.cell.scope, &fixture.cell.spec.class_name, 1)
+            .await
+            .unwrap();
+        let store = Arc::new(FaultStore::default());
+        let bucket = store.bucket();
+        let owner = Arc::new(crate::ownership_store::BucketOwnership::new(
+            bucket.clone(),
+            bucket,
+            "test-node".into(),
+            "generation-a".into(),
+        ));
+        owner
+            .cas_owner(&fixture.cell.scope, celld_logic::CasGuard::Absent, 1)
+            .await
+            .unwrap();
+        *fixture.engine().native_ownership_for_test.lock().unwrap() = Some(owner.clone());
+        let gate = StoreGate::new();
+        *store.put.lock().unwrap() = Some((
+            crate::native_handoff::owner_key(&fixture.cell.scope),
+            PutFault::Hold(gate.clone()),
+        ));
+        let waiting = fixture
+            .engine()
+            .allocation_request_from_event(
+                fixture.cell.clone(),
+                AllocationRequest::Start(fixture.options("queued-cold", false)),
+                Some(1),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        {
+            let connection = fixture.engine().allocations.connection.lock().unwrap();
+            assert_eq!(
+                Journal::mode(&connection, &fixture.cell.scope).unwrap(),
+                None
+            );
+            assert!(fixture
+                .engine()
+                .allocations
+                .records(&connection)
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(fixture.mutation_count(), 0);
+        fixture.cell.set_inactivity(Duration::from_secs(60));
+        let ticket = fixture
+            .engine()
+            .prepare_runtime_release(
+                &fixture.activation(),
+                if keep {
+                    Release::Keep
+                } else {
+                    Release::Destroy
+                },
+            )
+            .unwrap();
+        fixture.engine().release(ticket).await.unwrap();
+        gate.open();
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(fixture
+            .engine()
+            .allocations
+            .get(&fixture.cell.scope, "queued-cold")
+            .unwrap()
+            .is_none());
+        assert!(!fixture.engine().native_scope(&fixture.cell.scope).unwrap());
+        assert!(fixture
+            .engine()
+            .allocations
+            .legacy_record(&fixture.cell.scope)
+            .unwrap()
+            .is_none());
+        assert_eq!(fixture.mutation_count(), 0);
+        let previous = owner
+            .read_owner(&fixture.cell.scope)
+            .await
+            .unwrap()
+            .unwrap();
+        owner
+            .cas_owner(
+                &fixture.cell.scope,
+                celld_logic::CasGuard::Match(previous.etag),
+                2,
+            )
+            .await
+            .unwrap();
+        fixture.cell = fixture
+            .engine()
+            .attach_activation(&fixture.cell.scope, &fixture.cell.spec.class_name, 2)
+            .await
+            .unwrap()
+            .cell;
+        let current = fixture
+            .engine()
+            .allocation_request_from_event(
+                fixture.cell.clone(),
+                AllocationRequest::Start(fixture.options("queued-cold", false)),
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), current)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        fixture
+            .call(AllocationRequest::Destroy("queued-cold".into()))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_empty_runtime_release_reopen_start() {
+    let mut fixture = Fixture::new().await;
+    let scope = fixture.cell.scope.clone();
+    let journal = fixture.engine().native_journal_identity().unwrap();
+    let before = fixture.mutation_count();
+    for _ in 0..2 {
+        let ticket = fixture
+            .engine()
+            .prepare_runtime_release(&fixture.activation(), Release::Destroy)
+            .unwrap();
+        assert!(!fixture.cell.state.lock().unwrap().allocation_admitted);
+        fixture.engine().release(ticket).await.unwrap();
+        assert!(fixture.engine().cell(&scope).is_none());
+        {
+            let allocations = &fixture.engine().allocations;
+            let connection = allocations.connection.lock().unwrap();
+            assert_eq!(Journal::mode(&connection, &scope).unwrap(), None);
+            assert!(allocations.records(&connection).unwrap().is_empty());
+            assert!(allocations.legacy_records(&connection).unwrap().is_empty());
+        }
+        assert_eq!(fixture.mutation_count(), before);
+        fixture.reopen().await.unwrap();
+        assert_eq!(fixture.cell.scope, scope);
+        assert_eq!(fixture.engine().native_journal_identity().unwrap(), journal);
+    }
+    assert_eq!(
+        fixture
+            .call(AllocationRequest::Start(fixture.options("cold", false)))
+            .await
+            .status,
+        "running"
+    );
+    // Native cleanup must still use the captured attempt, not the empty legacy path.
+    fixture.release(Release::Destroy).await.unwrap();
+    assert_eq!(
+        fixture
+            .engine()
+            .allocations
+            .get(&scope, "cold")
+            .unwrap()
+            .unwrap()
+            .status,
+        "destroyed"
+    );
+    fixture.reopen().await.unwrap();
+    assert!(fixture.engine().native_scope(&scope).unwrap());
+    assert!(fixture
+        .engine()
+        .allocations
+        .legacy_record(&scope)
+        .unwrap()
+        .is_none());
+    assert!(fixture.engine().destroy(&fixture.cell).await.is_err());
+    assert_eq!(
+        fixture
+            .call(AllocationRequest::Destroy("cold".into()))
+            .await
+            .status,
+        "destroyed"
+    );
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_explicit_empty_destroy_is_mode_neutral() {
+    let fixture = Fixture::new().await;
+    let before = fixture.mutation_count();
+    for _ in 0..2 {
+        fixture.engine().destroy(&fixture.cell).await.unwrap();
+        let allocations = &fixture.engine().allocations;
+        let connection = allocations.connection.lock().unwrap();
+        assert_eq!(
+            Journal::mode(&connection, &fixture.cell.scope).unwrap(),
+            None
+        );
+        assert!(allocations.legacy_records(&connection).unwrap().is_empty());
+        assert!(allocations.records(&connection).unwrap().is_empty());
+    }
+    assert_eq!(fixture.mutation_count(), before);
+    assert!(fixture.cell.state.lock().unwrap().allocation_admitted);
+    assert_eq!(
+        fixture
+            .call(AllocationRequest::Start(
+                fixture.options("after-empty", false)
+            ))
+            .await
+            .status,
+        "running"
+    );
+    fixture
+        .call(AllocationRequest::Destroy("after-empty".into()))
+        .await;
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_genuine_legacy_history_stays_legacy() {
+    let mut fixture = Fixture::new().await;
+    fixture.cell = fixture.legacy_cell("history", false).await;
+    let scope = fixture.cell.scope.clone();
+    fixture.start_legacy(&fixture.cell).await.unwrap();
+    fixture.legacy_settled(&fixture.cell).await;
+    fixture.release(Release::Destroy).await.unwrap();
+    fixture.reopen().await.unwrap();
+    let record = fixture
+        .engine()
+        .allocations
+        .legacy_record(&scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.phase, "idle");
+    assert!(record.target.is_none());
+    assert!(record.cleanup.is_none());
+    let before = fixture.mutation_count();
+    fixture.engine().destroy(&fixture.cell).await.unwrap();
+    assert_eq!(fixture.mutation_count(), before);
+    let connection = fixture.engine().allocations.connection.lock().unwrap();
+    assert_eq!(
+        Journal::mode(&connection, &scope).unwrap().as_deref(),
+        Some("legacy")
+    );
+    drop(connection);
+    assert!(fixture
+        .engine()
+        .allocation_request(
+            fixture.cell.clone(),
+            AllocationRequest::Start(fixture.options("refused", false))
+        )
+        .is_err());
+    assert_eq!(fixture.mutation_count(), before);
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_prior_synchronous_legacy_claim_is_not_empty() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .engine()
+        .legacy_start_admission(&fixture.cell)
+        .unwrap();
+    assert!(fixture
+        .engine()
+        .allocations
+        .legacy_record(&fixture.cell.scope)
+        .unwrap()
+        .is_none());
+    fixture.release(Release::Destroy).await.unwrap();
+    fixture.reopen().await.unwrap();
+    assert_eq!(fixture.mutation_count(), 0);
+    let allocations = &fixture.engine().allocations;
+    assert_eq!(
+        allocations
+            .legacy_record(&fixture.cell.scope)
+            .unwrap()
+            .unwrap()
+            .phase,
+        "idle"
+    );
+    let connection = allocations.connection.lock().unwrap();
+    assert_eq!(
+        Journal::mode(&connection, &fixture.cell.scope)
+            .unwrap()
+            .as_deref(),
+        Some("legacy")
+    );
+    drop(connection);
+    assert!(fixture
+        .engine()
+        .allocation_request(
+            fixture.cell.clone(),
+            AllocationRequest::Start(fixture.options("refused", false))
+        )
+        .is_err());
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_unknown_legacy_create_retains_cleanup() {
+    let mut fixture = Fixture::new().await;
+    fixture.cell = fixture.legacy_cell("unknown", false).await;
+    let scope = fixture.cell.scope.clone();
+    let late_create = Gate::new();
+    {
+        let mut daemon = fixture.daemon.state.lock().unwrap();
+        daemon.late_create = Some(late_create.clone());
+    }
+    // The daemon loses the reply immediately, but owns a create still gated
+    // before publication. Do not depend on a short preparation timeout.
+    assert!(fixture.start_legacy(&fixture.cell).await.is_err());
+    tokio::time::timeout(Duration::from_secs(5), late_create.entered.notified())
+        .await
+        .unwrap();
+    fixture.legacy_settled(&fixture.cell).await;
+    let before = fixture.mutation_count();
+    let ticket = fixture
+        .engine()
+        .prepare_runtime_release(&fixture.activation(), Release::Destroy)
+        .unwrap();
+    assert!(fixture.engine().release(ticket).await.is_err());
+    let pending = fixture
+        .engine()
+        .allocations
+        .legacy_record(&scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.phase, "creating");
+    assert!(pending.target.is_none());
+    assert_eq!(
+        pending.cleanup,
+        Some(LegacyCleanup {
+            epoch: fixture.activation().epoch,
+            serial: fixture.activation().serial,
+            run: fixture.cell.current_run(),
+        })
+    );
+    assert_eq!(fixture.mutation_count(), before);
+    assert!(fixture.engine().cell(&scope).is_some());
+    fixture.close_engine().await;
+    let journal = Journal::open(&fixture.dir.path().join("state"), "test-node").unwrap();
+    let recovered = journal.legacy_record(&scope).unwrap().unwrap();
+    assert_eq!(recovered.phase, pending.phase);
+    assert_eq!(recovered.target, pending.target);
+    assert_eq!(recovered.cleanup, pending.cleanup);
+    assert!(journal
+        .reserve(
+            &fixture.cell,
+            Some(&fixture.options("refused", false)),
+            "refused",
+            &Value::Null
+        )
+        .is_err());
+    assert_eq!(fixture.mutation_count(), before);
+    // Allow only this fixture's delayed daemon request to finish before teardown.
+    late_create.open();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.daemon.state.lock().unwrap().containers.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_corrupt_recovery_never_completes_empty_release() {
+    for fault in ["missing-db", "missing-marker", "missing-lock", "bad-seal"] {
+        let fixture = Fixture::new().await;
+        let ticket = fixture
+            .engine()
+            .prepare_runtime_release(&fixture.activation(), Release::Destroy)
+            .unwrap();
+        let dir = fixture.dir.path().join("state");
+        match fault {
+            "bad-seal" => {
+                let connection =
+                    Connection::open(dir.join("container-allocations.sqlite")).unwrap();
+                connection
+                    .execute("UPDATE identity SET root=X'00'", [])
+                    .unwrap();
+            }
+            "missing-db" => std::fs::remove_file(dir.join("container-allocations.sqlite")).unwrap(),
+            "missing-marker" => {
+                std::fs::remove_file(dir.join("container-allocations.expected")).unwrap()
+            }
+            "missing-lock" => std::fs::remove_file(dir.join("container-allocations.lock")).unwrap(),
+            _ => unreachable!(),
+        }
+        let before = fixture.mutation_count();
+        assert!(fixture.engine().release(ticket).await.is_err(), "{fault}");
+        assert_eq!(fixture.mutation_count(), before, "{fault}");
+        assert!(fixture
+            .engine()
+            .cell(&fixture.cell.scope)
+            .is_some_and(|current| Arc::ptr_eq(&current, &fixture.cell)));
+        assert!(!fixture.cell.state.lock().unwrap().allocation_admitted);
+        assert!(fixture
+            .engine()
+            .allocation_request(
+                fixture.cell.clone(),
+                AllocationRequest::Start(fixture.options("refused", false))
+            )
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_empty_proof_cannot_retire_pending_or_stale_activation() {
+    let fixture = Fixture::new().await;
+    let old = fixture
+        .engine()
+        .prepare_runtime_release(&fixture.activation(), Release::Destroy)
+        .unwrap();
+    let pending = fixture
+        .engine()
+        .attach_pending(&fixture.cell.scope, &fixture.cell.spec.class_name, 2)
+        .await
+        .unwrap();
+    assert!(fixture.engine().release(old).await.is_err());
+    assert!(fixture.engine().cell(&fixture.cell.scope).is_some());
+    let activation = pending.commit();
+    let old = ContainerActivation {
+        cell: fixture.cell.clone(),
+        epoch: 0,
+        serial: activation.serial - 1,
+    };
+    assert!(fixture
+        .engine()
+        .forget(&old, fixture.cell.current_run())
+        .await
+        .is_err());
+    assert_eq!(fixture.mutation_count(), 0);
+    let ticket = fixture
+        .engine()
+        .prepare_runtime_release(&activation, Release::Destroy)
+        .unwrap();
+    fixture.engine().release(ticket).await.unwrap();
+    assert!(fixture.engine().cell(&fixture.cell.scope).is_none());
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_empty_destroy_refuses_inconsistent_memory() {
+    for fault in ["running", "target", "legacy-start", "pending"] {
+        let fixture = Fixture::new().await;
+        {
+            let mut state = fixture.cell.state.lock().unwrap();
+            match fault {
+                "running" => state.running = true,
+                "target" => state.allocation_container = Some("a".repeat(64)),
+                "legacy-start" => state.legacy_start = Some(LegacyStart { serial: 1, run: 0 }),
+                "pending" => state.activation_pending = true,
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            fixture.engine().destroy(&fixture.cell).await.is_err(),
+            "{fault}"
+        );
+        assert_eq!(fixture.mutation_count(), 0);
+        let allocations = &fixture.engine().allocations;
+        let connection = allocations.connection.lock().unwrap();
+        assert_eq!(
+            Journal::mode(&connection, &fixture.cell.scope).unwrap(),
+            None
+        );
+        assert!(allocations.legacy_records(&connection).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn native_allocation_cold_scope_busy_lifecycle_is_not_empty_success() {
+    let fixture = Fixture::new().await;
+    let lifecycle = fixture.cell.legacy_lifecycle.clone().lock_owned().await;
+    let ticket = fixture
+        .engine()
+        .prepare_runtime_release(&fixture.activation(), Release::Destroy)
+        .unwrap();
+    assert!(fixture.engine().release(ticket).await.is_err());
+    assert!(fixture.engine().cell(&fixture.cell.scope).is_some());
+    assert_eq!(fixture.mutation_count(), 0);
+    drop(lifecycle);
+    fixture.release(Release::Destroy).await.unwrap();
+    assert!(fixture.engine().cell(&fixture.cell.scope).is_none());
+    assert!(!fixture.engine().native_scope(&fixture.cell.scope).unwrap());
+    assert!(fixture
+        .engine()
+        .allocations
+        .legacy_record(&fixture.cell.scope)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn native_allocation_immutable_selection_replay_and_teardown() {
     let fixture = Fixture::new().await;
     let options = fixture.options("first", false);
