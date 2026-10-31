@@ -1673,7 +1673,8 @@ impl ContainerEngine {
             "HostConfig": host_config,
         });
         if let Some(entrypoint) = params.entrypoint {
-            body["Cmd"] = json!(entrypoint);
+            body["Entrypoint"] = json!(entrypoint);
+            body["Cmd"] = json!([]);
         }
         body
     }

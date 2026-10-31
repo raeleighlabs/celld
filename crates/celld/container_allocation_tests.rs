@@ -58,11 +58,32 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn create(&self, path: &str, body: Value) -> String {
+    fn create(&self, path: &str, mut body: Value) -> String {
         let mut state = self.state.lock().unwrap();
         state.next += 1;
         let id = format!("{:064x}", state.next);
         let name = path.strip_prefix("/containers/create?name=").unwrap();
+        // Docker merges Cmd only with an empty entrypoint and inherits only a null entrypoint.
+        if body["Entrypoint"]
+            .as_array()
+            .is_none_or(|argv| argv.is_empty())
+        {
+            if let Some(image) = state
+                .images
+                .get(body["Image"].as_str().expect("create image"))
+            {
+                if body["Cmd"].as_array().is_none_or(|argv| argv.is_empty()) {
+                    if let Some(cmd) = image["Config"].get("Cmd") {
+                        body["Cmd"] = cmd.clone();
+                    }
+                }
+                if body["Entrypoint"].is_null() {
+                    if let Some(entrypoint) = image["Config"].get("Entrypoint") {
+                        body["Entrypoint"] = entrypoint.clone();
+                    }
+                }
+            }
+        }
         let info = json!({
             "Id": id, "Name": format!("/{name}"), "Image": body["Image"],
             "Config": body, "State": { "Running": false, "Status": "created" },
@@ -1995,6 +2016,129 @@ async fn native_allocation_cold_scope_busy_lifecycle_is_not_empty_success() {
         .legacy_record(&fixture.cell.scope)
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn native_and_legacy_start_apply_entrypoint_argv_or_preserve_image_defaults() {
+    #[derive(Clone, Copy, Debug)]
+    enum StartKind {
+        Native,
+        Legacy,
+    }
+
+    for kind in [StartKind::Native, StartKind::Legacy] {
+        for entrypoint in [
+            Some(vec![
+                "/replacement".to_string(),
+                "--marker".to_string(),
+                "literal argument with spaces".to_string(),
+            ]),
+            Some(Vec::new()),
+            None,
+        ] {
+            let fixture = Fixture::new().await;
+            let image_entrypoint = json!(["/image-entrypoint", "image-entry-arg"]);
+            let image_cmd = json!(["image-default-arg"]);
+            for image in fixture
+                .daemon
+                .state
+                .lock()
+                .expect("daemon")
+                .images
+                .values_mut()
+            {
+                image["Config"] = json!({
+                    "Entrypoint": image_entrypoint,
+                    "Cmd": image_cmd,
+                });
+            }
+            let cell = match kind {
+                StartKind::Native => {
+                    let mut options = fixture.options("startup", false);
+                    options.entrypoint = entrypoint.clone();
+                    options.env = vec![("STARTUP_MARKER".to_string(), "forwarded".to_string())];
+                    assert_eq!(
+                        fixture.call(AllocationRequest::Start(options)).await.status,
+                        "running"
+                    );
+                    fixture.cell.clone()
+                }
+                StartKind::Legacy => {
+                    let cell = fixture.legacy_cell("startup", false).await;
+                    fixture
+                        .engine()
+                        .start(
+                            &cell,
+                            cell.begin_run(),
+                            StartParams {
+                                entrypoint: entrypoint.clone(),
+                                env: vec![("STARTUP_MARKER".to_string(), "forwarded".to_string())],
+                                enable_internet: false,
+                                labels: Vec::new(),
+                            },
+                        )
+                        .await
+                        .expect("legacy start");
+                    fixture.legacy_settled(&cell).await;
+                    cell
+                }
+            };
+            {
+                let state = fixture.daemon.state.lock().expect("daemon");
+                let body = &state
+                    .calls
+                    .iter()
+                    .find(|(_, path, _)| path.starts_with("/containers/create?"))
+                    .expect("create request reached Docker")
+                    .2;
+                let container = state.containers.values().next().expect("created container");
+                assert_eq!(container["State"]["Running"], true, "{kind:?}");
+                assert!(body["Env"]
+                    .as_array()
+                    .expect("create environment")
+                    .contains(&json!("STARTUP_MARKER=forwarded")));
+                match &entrypoint {
+                    Some(argv) => {
+                        assert_eq!(body["Entrypoint"], json!(argv), "{kind:?}");
+                        assert_eq!(body["Cmd"], json!([]), "{kind:?}");
+                        assert_eq!(container["Config"]["Entrypoint"], json!(argv), "{kind:?}");
+                        // Docker falls back to image Cmd for an explicitly empty entrypoint.
+                        let expected_cmd = if argv.is_empty() {
+                            &image_cmd
+                        } else {
+                            &body["Cmd"]
+                        };
+                        assert_eq!(&container["Config"]["Cmd"], expected_cmd, "{kind:?}");
+                    }
+                    None => {
+                        assert!(body.get("Entrypoint").is_none());
+                        assert!(body.get("Cmd").is_none());
+                        assert_eq!(
+                            container["Config"]["Entrypoint"], image_entrypoint,
+                            "{kind:?}"
+                        );
+                        assert_eq!(container["Config"]["Cmd"], image_cmd, "{kind:?}");
+                    }
+                }
+            }
+            match kind {
+                StartKind::Native => {
+                    assert_eq!(
+                        fixture
+                            .call(AllocationRequest::Destroy("startup".to_string()))
+                            .await
+                            .status,
+                        "destroyed"
+                    );
+                }
+                StartKind::Legacy => fixture
+                    .engine()
+                    .destroy(&cell)
+                    .await
+                    .expect("legacy destroy"),
+            }
+        }
+    }
 }
 
 #[tokio::test]
