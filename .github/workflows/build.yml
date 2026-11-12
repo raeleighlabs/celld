@@ -13,6 +13,7 @@ permissions:
 
 env:
   RUST_VERSION: 1.98.1
+  GO_VERSION: 1.27.1
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -39,7 +40,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -81,6 +82,29 @@ jobs:
           cargo build --release --locked -p celld
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
           target/release/celld --version | grep -F "$version"
+
+      - uses: actions/setup-go@v6
+        if: runner.os == 'Linux'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Test and package the static sandbox gate
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+          GOCACHE: ${{ runner.temp }}/celld-gate-cache
+          GO111MODULE: 'off'
+          GOTOOLCHAIN: local
+          GOMAXPROCS: '2'
+        run: |
+          set -euo pipefail
+          go test -race -p=1 ./tools/sandbox-gate/gate
+          mkdir -p out
+          bash tools/sandbox-gate/gate-build.sh "out/celld-sandbox-gate-$TARGET"
+          gzip -9 -n "out/celld-sandbox-gate-$TARGET"
+          cd out
+          sha256sum "celld-sandbox-gate-$TARGET.gz" > "celld-sandbox-gate-$TARGET.gz.sha256"
 
       - name: Package binary, provenance and licences
         env:

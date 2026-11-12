@@ -32,6 +32,15 @@ Each successful native job uploads `celld-native-<target>` containing:
   lockfile hash and uncompressed/compressed binary hashes.
 - `LICENSE` and `NOTICE`.
 
+Linux bundles also include `celld-sandbox-gate-<target>.gz`, its SHA-256 checksum
+and a `.json` build receipt with source, recipe and uncompressed binary hashes.
+The gate is built with Go 1.27.1 and tested with the race detector. macOS bundles
+do not contain a gate because native sandbox enforcement requires Linux.
+The OCI image carries the same helper at `/usr/local/bin/celld-sandbox-gate`,
+its receipt at `/usr/share/doc/celld/sandbox-gate.build.json` and the corresponding
+`CELLD_SANDBOX_GATE_PATH` setting. See [installation and qualification
+limits](../tools/sandbox-gate/DETAILING.md) before enabling sandbox allocations.
+
 Container jobs upload `celld-container-linux-amd64` and
 `celld-container-linux-arm64`, each containing an OCI archive and checksums.
 These are OCI image archives, not native executables or Docker-save archives.

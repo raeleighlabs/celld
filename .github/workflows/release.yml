@@ -84,6 +84,10 @@ jobs:
             sha256sum --check "celld-$target.gz.sha256"
             test -s "celld-$target.build.json"
           done
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            sha256sum --check "celld-sandbox-gate-$target.gz.sha256"
+            test -s "celld-sandbox-gate-$target.json"
+          done
           test -s LICENSE
           test -s NOTICE
           cat ./*.gz.sha256 > SHA256SUMS
