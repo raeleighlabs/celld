@@ -469,8 +469,8 @@ struct Config {
     /// class can override it, see `ContainerSpec::runtime`.
     runtime: Option<String>,
     /// `CELLD_CONTAINER_DNS`: the resolvers a container gets, overriding
-    /// `DEFAULT_CONTAINER_DNS`. Empty takes the default when a runtime is in
-    /// use and the daemon's otherwise.
+    /// `DEFAULT_CONTAINER_DNS`. Empty uses the public defaults for named runtimes
+    /// other than native runc, and the daemon's resolver otherwise.
     dns: Vec<String>,
     /// The node's state directory. celld writes the container resolv.conf
     /// here and bind-mounts it, so the path must be the same on the host as
@@ -623,8 +623,8 @@ impl ContainerEngine {
         data_dir: PathBuf,
     ) -> anyhow::Result<Self> {
         // Write the resolv.conf once, to bind into every container that runs
-        // under a non-default runtime. gVisor cannot reach Docker's embedded
-        // resolver, so a bind-mounted file with a public resolver, which the
+        // under a runtime other than native runc. gVisor cannot reach Docker's
+        // embedded resolver, so a bind-mounted file with a public resolver, which the
         // fence permits, is the only resolv.conf the container can use.
         let resolvers: Vec<String> = if dns.is_empty() {
             DEFAULT_CONTAINER_DNS
@@ -1641,13 +1641,14 @@ impl ContainerEngine {
         if let Some(runtime) = runtime {
             host_config["Runtime"] = json!(runtime);
         }
-        // A container under a non-default runtime gets an explicit resolver
-        // through a bind-mounted resolv.conf: gVisor cannot reach Docker's
+        // A runtime other than native runc gets an explicit resolver through a
+        // bind-mounted resolv.conf: gVisor cannot reach Docker's
         // embedded resolver at `127.0.0.11`, and on a user bridge Docker
         // keeps that address in resolv.conf whatever `--dns` says, so the
         // file itself must name a reachable resolver. An operator who set
         // `CELLD_CONTAINER_DNS` gets it for every container.
-        let wants_resolver = runtime.is_some() || !self.dns.is_empty();
+        let wants_resolver =
+            runtime.is_some_and(|runtime| runtime != "runc") || !self.dns.is_empty();
         if wants_resolver {
             if let Some(resolv) = &self.resolv_conf {
                 let bind = format!("{}:/etc/resolv.conf:ro", resolv.display());

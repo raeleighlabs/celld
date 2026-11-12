@@ -190,11 +190,14 @@ If the daemon lacks the runtime, every `start()` fails with the daemon error.
 For code that you did not write, name a runtime that gives each container its
 own kernel, and keep the secrets in the Worker.
 
-A container under a named runtime gets a written `/etc/resolv.conf` with
+A container under a named runtime other than native `runc` gets a written `/etc/resolv.conf` with
 `1.1.1.1` and `1.0.0.1`, or the `CELLD_CONTAINER_DNS` resolvers, because gVisor
 cannot reach the built-in resolver of the engine. The fence permits the public
-resolver. A container on the default runtime keeps the engine resolver unless
-the operator sets `CELLD_CONTAINER_DNS`.
+resolver. A container with no named runtime or explicit `runc`, whether selected
+by its class or the node default, keeps the engine resolver unless the operator
+sets `CELLD_CONTAINER_DNS`. An explicit DNS override still installs the resolver
+bind for `runc`. Sandbox profiles refuse that bind rather than silently discarding
+the override.
 
 ## Sleep, wake, and the node's resources
 
