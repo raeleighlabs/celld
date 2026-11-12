@@ -31,6 +31,8 @@ impl Gate {
     }
 }
 
+type CreateCheck = Arc<dyn Fn(&Value) + Send + Sync>;
+
 #[derive(Default)]
 struct DaemonState {
     images: HashMap<String, Value>,
@@ -49,6 +51,9 @@ struct DaemonState {
     fail_delete: bool,
     delete_gate: Option<Gate>,
     lose_delete_reply: bool,
+    retain_after_delete: bool,
+    sandbox_create_check: Option<CreateCheck>,
+    sandbox_start_check: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct Daemon {
@@ -60,6 +65,14 @@ struct Daemon {
 impl Daemon {
     fn create(&self, path: &str, mut body: Value) -> String {
         let mut state = self.state.lock().unwrap();
+        if let Some(check) = &state.sandbox_create_check {
+            check(&body);
+        }
+        if body["HostConfig"]["Runtime"] == "runc" {
+            body["HostConfig"]["PidMode"] = json!("");
+            body["HostConfig"]["UsernsMode"] = json!("");
+            body["HostConfig"]["Privileged"] = json!(false);
+        }
         state.next += 1;
         let id = format!("{:064x}", state.next);
         let name = path.strip_prefix("/containers/create?name=").unwrap();
@@ -84,8 +97,12 @@ impl Daemon {
                 }
             }
         }
+        let mounts: Vec<_> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount|
+            json!({"Type":"bind","Source":mount["Source"],"Destination":mount["Target"],"RW":false,"Propagation":"rprivate"})).collect();
         let info = json!({
             "Id": id, "Name": format!("/{name}"), "Image": body["Image"],
+            "HostConfig": body["HostConfig"], "Mounts": mounts, "LogPath":"",
+            "GraphDriver":{"Name":"overlay2","Data":{"UpperDir":"/simulated/upper","WorkDir":"/simulated/work"}},
             "Config": body, "State": { "Running": false, "Status": "created" },
             "NetworkSettings": { "Networks": { "internal": { "IPAddress": "172.30.0.2" } }, "Ports": { "8080/tcp": [{ "HostPort": "32123" }] } }
         });
@@ -251,6 +268,9 @@ impl Daemon {
                 return Ok(response(404, json!({})));
             }
             if let Some(id) = target.strip_suffix("/start") {
+                if let Some(check) = &state.sandbox_start_check {
+                    check();
+                }
                 if let Some(info) = state.containers.get_mut(id) {
                     info["State"] = json!({ "Running": true, "Status": "running" });
                     if let Some(gate) = state.after_start_inspect_gate.take() {
@@ -270,7 +290,11 @@ impl Daemon {
                     .iter()
                     .find(|(key, info)| key.as_str() == id || info["Name"] == format!("/{id}"))
                     .map(|(key, _)| key.clone());
-                let removed = resolved.is_some_and(|key| state.containers.remove(&key).is_some());
+                let removed = if state.retain_after_delete {
+                    resolved.is_some()
+                } else {
+                    resolved.is_some_and(|key| state.containers.remove(&key).is_some())
+                };
                 self.changed.notify_waiters();
                 if std::mem::take(&mut state.lose_delete_reply) {
                     return Err(std::io::Error::other("injected lost delete reply"));
@@ -284,6 +308,9 @@ impl Daemon {
         ))
     }
 }
+
+#[path = "container_sandbox_lifecycle_tests.rs"]
+mod sandbox_lifecycle;
 
 fn response(status: u16, body: Value) -> Response<Full<Bytes>> {
     let bytes = if status == 204 {

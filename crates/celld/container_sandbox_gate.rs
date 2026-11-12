@@ -120,6 +120,19 @@ fn static_executable(bytes: &[u8], platform: &str) -> anyhow::Result<()> {
 }
 
 impl Gate {
+    #[cfg(test)]
+    pub(super) fn simulation(&self) -> Option<std::sync::Arc<super::simulation::Control>> {
+        super::simulation::for_directory(&self.directory)
+    }
+
+    #[cfg(test)]
+    fn checkpoint(&self, point: super::simulation::Point, after: bool) -> anyhow::Result<()> {
+        if let Some(control) = self.simulation() {
+            control.checkpoint(point, after)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn validate(
         &self,
         attempt: &str,
@@ -385,8 +398,16 @@ impl Gate {
             "sandbox release inode changed"
         );
         file.seek(SeekFrom::Start(0))?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::ReleaseWrite, false)?;
         file.write_all(b"1")?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::ReleaseWrite, true)?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::ReleaseSync, false)?;
         file.sync_all()?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::ReleaseSync, true)?;
         anyhow::ensure!(self.opened()?, "sandbox release not observed");
         Ok(())
     }
@@ -396,12 +417,16 @@ impl Gate {
         self.verify_root(journal_directory)?;
         match std::fs::symlink_metadata(&self.directory) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(test)]
+                self.checkpoint(super::simulation::Point::ParentSync, false)?;
                 File::open(
                     self.directory
                         .parent()
                         .ok_or_else(|| anyhow!("gate parent missing"))?,
                 )?
                 .sync_all()?;
+                #[cfg(test)]
+                self.checkpoint(super::simulation::Point::ParentSync, true)?;
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
@@ -430,20 +455,42 @@ impl Gate {
             }
         }
         for path in [self.executable(), self.release()] {
+            #[cfg(test)]
+            let point = if path == self.executable() {
+                super::simulation::Point::GateUnlink
+            } else {
+                super::simulation::Point::ReleaseUnlink
+            };
+            #[cfg(test)]
+            self.checkpoint(point, false)?;
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            #[cfg(test)]
+            self.checkpoint(point, true)?;
         }
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::DirectorySync, false)?;
         File::open(&self.directory)?.sync_all()?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::DirectorySync, true)?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::DirectoryRemove, false)?;
         std::fs::remove_dir(&self.directory)?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::DirectoryRemove, true)?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::ParentSync, false)?;
         File::open(
             self.directory
                 .parent()
                 .ok_or_else(|| anyhow!("gate parent missing"))?,
         )?
         .sync_all()?;
+        #[cfg(test)]
+        self.checkpoint(super::simulation::Point::ParentSync, true)?;
         Ok(())
     }
 }
@@ -467,8 +514,16 @@ impl ContainerEngine {
             "sandbox command image unavailable"
         );
         let command = argv(&reply.json()?, &options.entrypoint)?;
-        let source = std::env::var_os("CELLD_SANDBOX_GATE_PATH")
-            .ok_or_else(|| anyhow!("CELLD_SANDBOX_GATE_PATH is required"))?;
+        let source = {
+            #[cfg(test)]
+            let simulated =
+                super::simulation::for_engine(self).map(|control| control.source.clone());
+            #[cfg(not(test))]
+            let simulated: Option<PathBuf> = None;
+            simulated
+                .or_else(|| std::env::var_os("CELLD_SANDBOX_GATE_PATH").map(PathBuf::from))
+                .ok_or_else(|| anyhow!("CELLD_SANDBOX_GATE_PATH is required"))?
+        };
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -601,7 +656,11 @@ impl ContainerEngine {
             .as_mut()
             .ok_or_else(|| anyhow!("sandbox gate missing"))?
             .phase = Phase::ReleasePending;
+        #[cfg(test)]
+        super::simulation::checkpoint(self, super::simulation::Point::ApprovalCommit, false)?;
         self.allocations.save(record)?;
+        #[cfg(test)]
+        super::simulation::checkpoint(self, super::simulation::Point::ApprovalCommit, true)?;
         anyhow::ensure!(
             !record.destroy_requested,
             "sandbox release closed by cleanup"
@@ -616,7 +675,12 @@ impl ContainerEngine {
             .as_mut()
             .ok_or_else(|| anyhow!("sandbox gate missing"))?
             .phase = Phase::Released;
-        self.allocations.save(record)
+        #[cfg(test)]
+        super::simulation::checkpoint(self, super::simulation::Point::FinalCommit, false)?;
+        self.allocations.save(record)?;
+        #[cfg(test)]
+        super::simulation::checkpoint(self, super::simulation::Point::FinalCommit, true)?;
+        Ok(())
     }
 }
 

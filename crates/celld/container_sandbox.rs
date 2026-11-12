@@ -162,6 +162,10 @@ impl Sandbox {
         let work = info["GraphDriver"]["Data"]["WorkDir"]
             .as_str()
             .ok_or_else(|| anyhow!("sandbox workdir missing"))?;
+        #[cfg(test)]
+        if let Some(simulation) = gate.simulation() {
+            return simulation.verify_host();
+        }
         anyhow::ensure!(
             verify_quota(upper, self.disk_bytes)? == verify_quota(work, self.disk_bytes)?,
             "sandbox overlay workdir and upperdir project mismatch"
@@ -182,6 +186,10 @@ impl ContainerEngine {
         sandbox: &Sandbox,
     ) -> anyhow::Result<()> {
         sandbox.validate()?;
+        #[cfg(test)]
+        if let Some(simulation) = super::simulation::for_engine(self) {
+            return simulation.verify_host();
+        }
         anyhow::ensure!(cfg!(target_os = "linux"), "sandbox requires Linux");
         let reply = self.allocation_call("GET", "/info", None).await?;
         anyhow::ensure!(

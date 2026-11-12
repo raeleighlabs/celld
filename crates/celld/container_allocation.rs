@@ -1879,7 +1879,11 @@ impl ContainerEngine {
         }
         record.status = "destroyed".to_string();
         record.reason = None;
+        #[cfg(test)]
+        simulation::checkpoint(self, simulation::Point::TombstoneCommit, false)?;
         self.allocations.save(&mut record)?;
+        #[cfg(test)]
+        simulation::checkpoint(self, simulation::Point::TombstoneCommit, true)?;
         let run = {
             let mut state = cell.state.lock().unwrap();
             state.running = false;
@@ -1891,6 +1895,10 @@ impl ContainerEngine {
         Ok(record.view(None))
     }
 }
+
+#[cfg(test)]
+#[path = "container_sandbox_simulation.rs"]
+mod simulation;
 
 #[cfg(all(test, not(celld_internal_tests)))]
 #[path = "container_allocation_tests.rs"]

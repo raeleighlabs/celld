@@ -60,3 +60,44 @@ AMD64 live behaviour, genuine compat-ABI execution, broader gate fault injection
 and coding-agent/PTY compatibility remain unqualified. The fixed ioctl policy
 denies terminal controls that interactive workloads may need. CI unit tests and
 builds are not live Docker/XFS qualification or proof of per-session VM isolation.
+
+## Coordinator fault coverage
+
+`crates/celld/container_sandbox_lifecycle_tests.rs` drives the actual native
+allocation coordinator through its queued request API and Unix-socket Docker
+adapter. It uses the sealed SQLite journal and private gate files on the host
+filesystem. An independent read-only SQLite connection and file-descriptor
+metadata checks observe durable records, release bytes and exact ownership.
+
+The test-only `container_sandbox_simulation.rs` registry replaces only the
+external Linux/XFS host-verification boundary and installed helper input. It
+does not manufacture `/proc`, quota ioctl results or kernel mount evidence.
+The Docker adapter is simulated and the ELF-shaped input is never executed.
+Configuration, gate identity, journal sealing, release and cleanup code remain
+the production implementations. Tests therefore establish coordinator behaviour,
+not host enforcement or workload execution. Ordinary tests without a scoped
+registration still use the real verifier, including its Linux-only refusal.
+No simulation control is compiled into production.
+
+The exhaustive schedules inject errors or abrupt task termination immediately
+before and after approval commit, release write, release fsync, final phase
+commit, both file unlinks, directory fsync, rmdir, parent fsync and tombstone
+commit. Schedule 7 terminates the coordinator task and schedule 42 returns an
+I/O error. Every schedule reopens the real journal and retries with faults
+removed. This models process interruption and recoverable operation failures,
+not loss/reordering of acknowledged writes after a machine power failure.
+Explicit socket barriers cover dropped callers and concurrent cleanup. The
+release oracle requires committed approval before visible release. The cleanup
+oracle requires native absence and retained intent before removing owned files
+and requires completed removal before the tombstone. Deadlines only bound hangs,
+they do not determine the schedule.
+
+Run the focused schedules with:
+
+```sh
+cargo test --locked -p celld --lib container::allocation::tests::sandbox_lifecycle -- --test-threads=1
+```
+
+The individual test names select release faults, cleanup faults, cancelled
+waiters, approval races, verifier refusal and unconfirmed native deletion.
+Fault messages include the schedule, boundary and before/after edge.
