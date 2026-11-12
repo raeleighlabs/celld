@@ -707,7 +707,10 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Gate) {
         let root = tempfile::tempdir().unwrap();
         let token = "a".repeat(64);
-        let directory = root.path().join("sandbox-gates").join(&token);
+        let directory = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("sandbox-gates")
+            .join(&token);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let bytes = b"owned gate fixture";
