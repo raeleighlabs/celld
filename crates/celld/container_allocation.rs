@@ -24,7 +24,21 @@ pub struct AllocationOptions {
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub enable_internet: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sandbox::present"
+    )]
+    pub sandbox: Option<Box<Sandbox>>,
 }
+
+#[path = "container_sandbox.rs"]
+mod sandbox;
+pub use sandbox::Sandbox;
+#[path = "container_sandbox_gate.rs"]
+mod gate;
+#[path = "container_sandbox_seccomp.rs"]
+mod seccomp;
 
 pub enum AllocationRequest {
     Start(AllocationOptions),
@@ -75,6 +89,12 @@ pub(super) struct Record {
     destroy_requested: bool,
     status: String,
     reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox: Option<Sandbox>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gate: Option<gate::Gate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox_seccomp: Option<seccomp::Policy>,
 }
 
 impl Record {
@@ -97,6 +117,27 @@ impl Record {
             "allocation journal identity mismatch"
         );
         valid_id(&self.id)?;
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.validate()?;
+        }
+        anyhow::ensure!(
+            self.sandbox.is_some() == self.sandbox_seccomp.is_some(),
+            "sandbox seccomp ownership missing or unexpected"
+        );
+        if let Some(policy) = &self.sandbox_seccomp {
+            policy.validate()?;
+        }
+        anyhow::ensure!(
+            self.gate.is_none() || self.sandbox.is_some(),
+            "gate without sandbox"
+        );
+        anyhow::ensure!(
+            !self.create_dispatched || self.sandbox.is_none() || self.gate.is_some(),
+            "sandbox gate ownership missing"
+        );
+        if let Some(gate) = &self.gate {
+            gate.validate(&self.attempt, self.create_dispatched, self.create_confirmed)?;
+        }
         anyhow::ensure!(hex_value(&self.attempt, 64), "invalid allocation attempt");
         anyhow::ensure!(
             self.name == attempt_name(node, scope, id, &self.attempt),
@@ -209,6 +250,9 @@ fn valid_platform(platform: &str) -> anyhow::Result<()> {
 
 impl AllocationOptions {
     fn normalise(&mut self) -> anyhow::Result<()> {
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.validate()?;
+        }
         valid_id(&self.id)?;
         valid_image(&self.image, "celld-image:")?;
         valid_image(&self.engine_image, "sha256:")?;
@@ -598,7 +642,13 @@ impl Journal {
         let mut scopes = std::collections::BTreeMap::new();
         for record in self.records(&connection)? {
             if record.status != "destroyed" {
-                scopes.insert(record.scope, record.spec);
+                let mut spec = record.spec;
+                if record.sandbox.is_some() {
+                    // Existing capacity samples encode instance types, not byte counts.
+                    // Basic reserves 1 GiB, conservatively covering every sandbox profile.
+                    spec.instance_type = Some("basic".to_string());
+                }
+                scopes.insert(record.scope, spec);
             }
         }
         for record in self.legacy_records(&connection)? {
@@ -943,8 +993,16 @@ impl Journal {
     ) -> anyhow::Result<bool> {
         valid_id(id)?;
         self.check()?;
+        let sandbox_seccomp = options
+            .filter(|options| options.sandbox.is_some())
+            .map(|_| seccomp::Policy::new())
+            .transpose()?;
+        let mut policy = policy.clone();
+        if let Some(seccomp) = &sandbox_seccomp {
+            policy["sandboxSeccomp"] = serde_json::to_value(seccomp)?;
+        }
         let fingerprint = options
-            .map(|options| serde_json::to_vec(&(options, &*cell.spec, policy)))
+            .map(|options| serde_json::to_vec(&(options, &*cell.spec, &policy)))
             .transpose()?
             .map(|bytes| encode_hex(&self.mac(b"allocation-request-v1", &bytes)));
         let mut connection = self.connection.lock().unwrap();
@@ -959,7 +1017,10 @@ impl Journal {
             .find(|record| record.scope == cell.scope && record.id == id)
         {
             if options.is_some() {
-                anyhow::ensure!(record.fingerprint == fingerprint, "allocation id was already used with different inputs or destroyed before start");
+                anyhow::ensure!(
+                    record.fingerprint == fingerprint,
+                    "allocation id was already used with different inputs or destroyed before start"
+                );
             }
             if options.is_none() && record.status != "destroyed" {
                 let mut record = record.clone();
@@ -990,6 +1051,9 @@ impl Journal {
             name: attempt_name(&self.node, &cell.scope, id, &attempt),
             attempt,
             fingerprint,
+            sandbox: options.and_then(|options| options.sandbox.as_deref().cloned()),
+            gate: None,
+            sandbox_seccomp,
             spec: (*cell.spec).clone(),
             image: options.map(|o| o.image.clone()),
             engine_image: options.map(|o| o.engine_image.clone()),
@@ -1431,6 +1495,11 @@ impl ContainerEngine {
             )
             .await?;
 
+            if let Some(sandbox) = &record.sandbox {
+                self.qualify_sandbox(&options.engine_image, sandbox).await?;
+                self.prepare_sandbox_gate(&mut record, &options).await?;
+            }
+
             asyncrt::timeout(DEADLINE, self.enforce_instance_ceiling(cell))
                 .await
                 .map_err(|_| anyhow!("allocation capacity deadline exceeded"))??;
@@ -1441,7 +1510,10 @@ impl ContainerEngine {
         .await;
         let (open, internal) = match preparation {
             Ok(networks) => networks,
-            Err(_) => {
+            Err(error) => {
+                if record.sandbox.is_some() {
+                    tracing::warn!(allocation = %record.id, error = %error, "sandbox preparation refused");
+                }
                 record.status = "failed".to_string();
                 record.reason = Some("preparationFailed".to_string());
                 self.allocations.save(&mut record)?;
@@ -1468,6 +1540,24 @@ impl ContainerEngine {
             &internal,
         );
         body["Labels"][ATTEMPT_LABEL] = json!(record.attempt);
+        if let Some(sandbox) = &record.sandbox {
+            if sandbox.apply(&mut body).is_err() {
+                record.status = "failed".to_string();
+                record.reason = Some("sandboxControlsUnsupported".to_string());
+                self.allocations.save(&mut record)?;
+                return Ok(record.view(None));
+            }
+            record
+                .gate
+                .as_ref()
+                .ok_or_else(|| anyhow!("sandbox gate missing"))?
+                .apply(&mut body)?;
+            record
+                .sandbox_seccomp
+                .as_ref()
+                .ok_or_else(|| anyhow!("sandbox seccomp missing"))?
+                .apply(&mut body)?;
+        }
         body["Labels"]["celld.allocation.id"] = json!(record.id);
         record.status = "creating".to_string();
         record.create_dispatched = true;
@@ -1517,7 +1607,7 @@ impl ContainerEngine {
         if record.destroy_requested {
             return self.destroy_allocation_locked(cell, &record.id).await;
         }
-        if !matches!(self.owned_container(&record).await, Ok(Some(_))) {
+        if !matches!(self.verified_container(&record).await, Ok(Some(_))) {
             return self.unknown(record, "createdContainerUnverified");
         }
         record.status = "starting".to_string();
@@ -1594,6 +1684,37 @@ impl ContainerEngine {
         Ok(Some(info))
     }
 
+    async fn verified_container(&self, record: &Record) -> anyhow::Result<Option<Value>> {
+        let info = self.owned_container(record).await?;
+        if let (Some(sandbox), Some(info)) = (&record.sandbox, &info) {
+            let result = async {
+                self.qualify_sandbox(record.engine_image.as_deref().unwrap_or(""), sandbox)
+                    .await?;
+                let gate = record
+                    .gate
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("sandbox gate ownership missing"))?;
+                gate.verify_root(
+                    self.allocations
+                        .path
+                        .parent()
+                        .ok_or_else(|| anyhow!("journal parent missing"))?,
+                )?;
+                let policy = record
+                    .sandbox_seccomp
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("sandbox seccomp missing"))?;
+                sandbox.verify(info, gate, policy)
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(allocation = %record.id, error = %error, "sandbox verification refused");
+            }
+            result?;
+        }
+        Ok(info)
+    }
+
     pub(super) async fn observe_allocation(
         &self,
         cell: &Arc<CellContainer>,
@@ -1602,7 +1723,7 @@ impl ContainerEngine {
         if matches!(record.status.as_str(), "destroyed" | "failed" | "reserved") {
             return Ok(record.view(None));
         }
-        let info = match self.owned_container(&record).await {
+        let info = match self.verified_container(&record).await {
             Ok(Some(info)) => info,
             Ok(None) => return self.unknown(record, "containerNotObserved"),
             Err(_) => return self.unknown(record, "containerUnverified"),
@@ -1641,6 +1762,14 @@ impl ContainerEngine {
             platform: platform.to_string(),
             status,
         };
+        if running
+            && record.sandbox.is_some()
+            && record.create_confirmed
+            && !record.destroy_requested
+            && self.release_sandbox_gate(&mut record, &info).is_err()
+        {
+            return self.unknown(record, "sandboxGateReleaseUnknown");
+        }
         if !record.create_confirmed {
             record.status = "unknown".to_string();
             record.reason = Some("createOutcomeUnknown".to_string());
@@ -1727,6 +1856,25 @@ impl ContainerEngine {
             // even a later 404 cannot settle an unacknowledged create request.
             if !record.create_confirmed {
                 return self.unknown(record, "createOutcomeUnknown");
+            }
+        }
+        if let Some(gate) = &record.gate {
+            if record.create_dispatched
+                && !record.create_rejected
+                && !matches!(self.owned_container(&record).await, Ok(None))
+            {
+                return self.unknown(record, "sandboxGateCleanupTargetUnverified");
+            }
+            if gate
+                .cleanup(
+                    self.allocations
+                        .path
+                        .parent()
+                        .ok_or_else(|| anyhow!("journal parent missing"))?,
+                )
+                .is_err()
+            {
+                return self.unknown(record, "sandboxGateCleanupPending");
             }
         }
         record.status = "destroyed".to_string();

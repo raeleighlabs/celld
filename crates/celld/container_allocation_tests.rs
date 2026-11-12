@@ -486,6 +486,7 @@ impl Fixture {
 
     fn options(&self, id: &str, second: bool) -> AllocationOptions {
         AllocationOptions {
+            sandbox: None,
             id: id.to_string(),
             image: format!("celld-image:{}", if second { "b" } else { "a" }.repeat(64)),
             engine_image: format!("sha256:{}", if second { "2" } else { "1" }.repeat(64)),
@@ -543,6 +544,77 @@ impl Drop for Fixture {
             task.abort();
         }
     }
+}
+
+#[tokio::test]
+async fn sandbox_profile_is_sealed_and_fingerprinted_without_dispatch() {
+    let mut fixture = Fixture::new().await;
+    let mut options = fixture.options("sandbox-profile", false);
+    options.sandbox = Some(serde_json::from_value(json!({
+        "version":1,"profile":"small","enforcement":"overlay2-xfs-v1",
+        "cpuMillis":250,"memoryBytes":268435456,"diskBytes":67108864,"pidsLimit":128,"shmBytes":8388608
+    })).unwrap());
+    options.normalise().unwrap();
+    let journal = &fixture.engine().allocations;
+    let policy = json!({"test":"sandbox"});
+    assert!(journal
+        .reserve(&fixture.cell, Some(&options), &options.id, &policy)
+        .unwrap());
+    assert!(!journal
+        .reserve(&fixture.cell, Some(&options), &options.id, &policy)
+        .unwrap());
+    let mut changed = options.clone();
+    changed.sandbox = Some(serde_json::from_value(json!({
+        "version":1,"profile":"medium","enforcement":"overlay2-xfs-v1",
+        "cpuMillis":500,"memoryBytes":536870912,"diskBytes":134217728,"pidsLimit":128,"shmBytes":8388608
+    })).unwrap());
+    changed.normalise().unwrap();
+    assert!(journal
+        .reserve(&fixture.cell, Some(&changed), &changed.id, &policy)
+        .is_err());
+    fixture.reopen().await.unwrap();
+    let retained = fixture
+        .engine()
+        .allocations
+        .get(&fixture.cell.scope, &options.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.sandbox.as_ref(), options.sandbox.as_deref());
+    assert_eq!(
+        retained.sandbox_seccomp,
+        Some(seccomp::Policy::new().unwrap())
+    );
+    let mut drift = retained.clone();
+    drift.sandbox_seccomp = None;
+    assert!(drift
+        .validate(&retained.node, &retained.scope, &retained.id)
+        .is_err());
+    let mut effective = policy;
+    effective["sandboxSeccomp"] = serde_json::to_value(seccomp::Policy::new().unwrap()).unwrap();
+    let bytes = serde_json::to_vec(&(&options, &*fixture.cell.spec, &effective)).unwrap();
+    assert_eq!(
+        retained.fingerprint,
+        Some(encode_hex(
+            &fixture
+                .engine()
+                .allocations
+                .mac(b"allocation-request-v1", &bytes)
+        ))
+    );
+    assert_eq!(fixture.mutation_count(), 0);
+}
+
+#[tokio::test]
+async fn sandbox_unsupported_daemon_never_creates_or_starts_workload() {
+    let fixture = Fixture::new().await;
+    let mut options = fixture.options("unsupported-sandbox", false);
+    options.sandbox = Some(serde_json::from_value(json!({
+        "version":1,"profile":"small","enforcement":"overlay2-xfs-v1",
+        "cpuMillis":250,"memoryBytes":268435456,"diskBytes":67108864,"pidsLimit":128,"shmBytes":8388608
+    })).unwrap());
+    let view = fixture.call(AllocationRequest::Start(options)).await;
+    assert_eq!(view.status, "failed");
+    assert_eq!(fixture.mutation_count(), 0);
 }
 
 #[tokio::test]

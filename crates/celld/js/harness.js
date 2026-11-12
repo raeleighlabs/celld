@@ -2504,7 +2504,7 @@ class Container {
     const brand = __allocationReceiver(this);
     if (!__allocationObject(options))
       throw new TypeError("startAllocation requires an options object");
-    const allowed = new Set(["id", "image", "engineImage", "platform", "env", "entrypoint", "enableInternet"]);
+    const allowed = new Set(["id", "image", "engineImage", "platform", "env", "entrypoint", "enableInternet", "sandbox"]);
     for (const name of Object.keys(options)) {
       if (!allowed.has(name)) throw new TypeError("unknown allocation option");
     }
@@ -2526,10 +2526,22 @@ class Container {
     const size = [options.id, options.image, options.engineImage, options.platform,
       ...env.flat(), ...(entrypoint ?? [])].reduce((sum, text) => sum + text.length, 0);
     if (size > 65536) throw new RangeError("allocation options exceed limit");
+    let sandbox;
+    if (options.sandbox !== undefined) {
+      const value = options.sandbox;
+      if (!__allocationObject(value)) throw new TypeError("sandbox must be an exact profile object");
+      const tuple = { small: [250, 268435456, 67108864], medium: [500, 536870912, 134217728], large: [1000, 1073741824, 268435456] };
+      const profile = Object.hasOwn(tuple, value.profile) ? tuple[value.profile] : undefined;
+      sandbox = { version: 1, profile: value.profile, enforcement: "overlay2-xfs-v1",
+        cpuMillis: profile?.[0], memoryBytes: profile?.[1], diskBytes: profile?.[2], pidsLimit: 128, shmBytes: 8388608 };
+      if (!profile || Object.keys(value).length !== Object.keys(sandbox).length ||
+          Object.entries(sandbox).some(([key, expected]) => !Object.hasOwn(value, key) || value[key] !== expected))
+        throw new TypeError("sandbox profile constants mismatch");
+    }
     const params = {
       id: options.id, image: options.image, engineImage: options.engineImage,
       platform: options.platform, enableInternet: options.enableInternet ?? false,
-      env, entrypoint,
+      env, entrypoint, sandbox,
     };
     const result = JSON.parse(await __container_start_allocation(brand.token, JSON.stringify(params)));
     this._destroyReason = undefined;

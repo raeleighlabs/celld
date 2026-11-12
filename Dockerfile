@@ -3,6 +3,17 @@
 ARG RUST_VERSION=1.98.1
 ARG CELLD_COMMIT=unknown
 
+FROM golang:1.27.1-bookworm AS sandbox-gate
+WORKDIR /src
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 && \
+    rm -rf /var/lib/apt/lists/*
+COPY tools/sandbox-gate ./tools/sandbox-gate
+ENV GOCACHE=/root/.cache/go-build GO111MODULE=off GOTOOLCHAIN=local GOMAXPROCS=2
+RUN --mount=type=cache,id=celld-gate-go-cache,target=/root/.cache/go-build,sharing=locked \
+    go test -race -p=1 ./tools/sandbox-gate/gate && \
+    bash tools/sandbox-gate/gate-build.sh /out/celld-sandbox-gate
+
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
 # `release` for shipped artifacts; a fast-loop caller passes `lab` to skip
@@ -44,4 +55,7 @@ LABEL org.opencontainers.image.title="celld" \
       org.opencontainers.image.version="${CELLD_VERSION}"
 COPY LICENSE NOTICE /usr/share/doc/celld/
 COPY --from=test /out/celld /usr/local/bin/celld
+COPY --from=sandbox-gate /out/celld-sandbox-gate /usr/local/bin/celld-sandbox-gate
+COPY --from=sandbox-gate /out/celld-sandbox-gate.json /usr/share/doc/celld/sandbox-gate.build.json
+ENV CELLD_SANDBOX_GATE_PATH=/usr/local/bin/celld-sandbox-gate
 ENTRYPOINT ["/usr/local/bin/celld"]

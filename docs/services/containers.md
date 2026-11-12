@@ -44,7 +44,7 @@ with a `webSocket`, as on Cloudflare. The node logs a failed `start()` as
 
 This fork also provides three promise-based methods on `ctx.container`:
 
-- `startAllocation({ id, image, engineImage, platform, env?, entrypoint?, enableInternet? })`
+- `startAllocation({ id, image, engineImage, platform, env?, entrypoint?, enableInternet?, sandbox? })`
   starts a journalled attempt using a prepared local image. `image` is a
   `celld-image:` identity, `engineImage` is an immutable `sha256:` engine ID,
   and `platform` is `linux/amd64` or `linux/arm64`.
@@ -52,6 +52,47 @@ This fork also provides three promise-based methods on `ctx.container`:
   replacement.
 - `destroyAllocation(id)` records cleanup intent and removes only the exact
   allocation owned by that attempt.
+
+The unpublished sandbox candidate accepts an optional exact object:
+`{version:1, profile:"small", enforcement:"overlay2-xfs-v1", cpuMillis:250,
+memoryBytes:268435456, diskBytes:67108864, pidsLimit:128, shmBytes:8388608}`.
+Medium replaces CPU/memory/disk with `(500,536870912,134217728)` and large with
+`(1000,1073741824,268435456)`. All fields are mandatory when sandbox is present.
+Unknown fields, null and changed constants are refused. Omission preserves the
+legacy wire and fingerprint. The full profile is retained in the sealed native
+journal and fingerprint. This candidate requires locally accessible Linux classic
+overlay2 on enforcing XFS project quotas, runc and resource-control support.
+Image-declared volumes and caller bind mounts are refused. Container logging is disabled.
+An explicit Docker seccomp policy preserves the pinned Moby default rules except
+that ioctl is restricted to three read-only metadata requests. All project-mutating
+ioctls, including compat and altered request encodings, are denied with EPERM.
+The complete policy is journalled and fingerprinted, and exact HostConfig policy
+matching plus kernel seccomp/no-new-privileges evidence precede gate release.
+This applies to Docker-exec processes as well as the workload and its children.
+Generated network identity files are read-only and shm has a separate RAM-backed
+cap. The upperdir's exact project quota and created mount specification are checked
+before start. A generated file may have a covered writable mount beneath runc's
+read-only self-bind. The visible regular file's kernel descriptor mount ID must
+select a read-only mount at that exact path. All same-path mounts must form one
+parent chain with identical device, filesystem root, type and source. Missing
+evidence, branches, disconnected duplicates and a writable visible mount refuse
+release. This exception applies only to hosts, hostname and resolver files, not
+the root, gate or other writable-mount checks. Docker initially launches only an
+allocator-owned static trusted gate, mounted read-only with its bounded release
+file. Inherited healthchecks,
+Docker init and automatic restarts are disabled in sandbox mode. Set the trusted
+host environment `CELLD_SANDBOX_GATE_PATH` to the separately built static helper.
+Linux native bundles and OCI images now include that helper and its build receipt.
+See [gate build and installation](../../tools/sandbox-gate/DETAILING.md) for the
+fork-owned source, trusted installation requirements and qualification limits.
+The live namespace and gate inode identities are checked before a journalled gate
+release permits the original image command to execute. The copied helper, command,
+file identities and release phase are retained in the allocation journal. An
+uncertain release is reconciled without blindly restarting the allocation. The
+workload replaces the gate as PID 1 and must handle signals and child reaping.
+Quotas charge
+allocated upperdir blocks, including copy-up, not immutable image layers or Docker
+metadata. A build is not live qualification and this is not a published release.
 
 Results include the attempt ID, status and image identities. `running` means
 the process is running, not that the application is ready. Only `destroyed`
