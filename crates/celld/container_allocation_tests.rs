@@ -442,14 +442,22 @@ impl Fixture {
     }
 
     async fn reopen(&mut self) -> anyhow::Result<()> {
+        self.reopen_with(None, Vec::new()).await
+    }
+
+    async fn reopen_with(
+        &mut self,
+        runtime: Option<String>,
+        dns: Vec<String>,
+    ) -> anyhow::Result<()> {
         self.close_engine().await;
         let engine = Arc::new(
             ContainerEngine::connect(
                 Docker::new(&self.socket),
                 "test-node".to_string(),
                 None,
-                None,
-                Vec::new(),
+                runtime,
+                dns,
                 self.dir.path().join("state"),
             )
             .await?,
@@ -2236,6 +2244,82 @@ async fn native_and_legacy_start_apply_entrypoint_argv_or_preserve_image_default
                     .await
                     .expect("legacy destroy"),
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_body_resolver_selection_preserves_runtime_precedence_and_operator_dns() {
+    for (class_runtime, node_runtime, dns, expected_runtime, resolver_bind) in [
+        (None, None, false, None, false),
+        (Some("runc"), None, false, Some("runc"), false),
+        (None, Some("runc"), false, Some("runc"), false),
+        (Some("runc"), Some("runsc"), false, Some("runc"), false),
+        (Some("runsc"), Some("runc"), false, Some("runsc"), true),
+        (None, Some("runsc"), false, Some("runsc"), true),
+        (Some("kata"), None, false, Some("kata"), true),
+        (None, None, true, None, true),
+        (Some("runc"), None, true, Some("runc"), true),
+        (None, Some("runc"), true, Some("runc"), true),
+    ] {
+        let mut fixture = Fixture::new().await;
+        fixture
+            .reopen_with(
+                node_runtime.map(str::to_string),
+                if dns {
+                    vec!["9.9.9.9".into()]
+                } else {
+                    Vec::new()
+                },
+            )
+            .await
+            .unwrap();
+        let mut spec = (*fixture.cell.spec).clone();
+        spec.runtime = class_runtime.map(str::to_string);
+        install_specs(vec![spec.clone()], None);
+        fixture.cell = fixture
+            .engine()
+            .attach(
+                &format!("{}-resolver", fixture.cell.scope),
+                &spec.class_name,
+            )
+            .await
+            .unwrap();
+        let resolver = fixture.engine().resolv_conf.as_ref().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(resolver).unwrap(),
+            if dns {
+                "nameserver 9.9.9.9\n"
+            } else {
+                "nameserver 1.1.1.1\nnameserver 1.0.0.1\n"
+            }
+        );
+        let body = fixture.engine().create_body(
+            &fixture.cell,
+            StartParams {
+                entrypoint: None,
+                env: Vec::new(),
+                enable_internet: false,
+                labels: Vec::new(),
+            },
+            "test-image",
+            "test-open",
+            "test-internal",
+        );
+        let context = format!("class={class_runtime:?}, node={node_runtime:?}, dns={dns}");
+        assert_eq!(
+            body["HostConfig"]["Runtime"],
+            json!(expected_runtime),
+            "{context}"
+        );
+        if resolver_bind {
+            assert_eq!(
+                body["HostConfig"]["Binds"],
+                json!([format!("{}:/etc/resolv.conf:ro", resolver.display())]),
+                "{context}"
+            );
+        } else {
+            assert!(body["HostConfig"].get("Binds").is_none(), "{context}");
         }
     }
 }

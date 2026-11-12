@@ -49,10 +49,24 @@ fn assert_release_safety(record: &Value) {
 }
 
 async fn sandbox_fixture() -> (Fixture, Arc<Control>, Registration) {
+    sandbox_fixture_with(Some("runc"), None, Vec::new()).await
+}
+
+async fn sandbox_fixture_with(
+    class_runtime: Option<&str>,
+    node_runtime: Option<&str>,
+    dns: Vec<String>,
+) -> (Fixture, Arc<Control>, Registration) {
     let mut fixture = Fixture::new().await;
+    if node_runtime.is_some() || !dns.is_empty() {
+        fixture
+            .reopen_with(node_runtime.map(str::to_string), dns)
+            .await
+            .unwrap();
+    }
     let mut spec = (*fixture.cell.spec).clone();
     spec.class_name = "SandboxLifecycleTest".into();
-    spec.runtime = None;
+    spec.runtime = class_runtime.map(str::to_string);
     spec.max_instances = None;
     install_specs(vec![spec.clone()], None);
     fixture.cell = fixture
@@ -80,6 +94,73 @@ async fn sandbox_fixture() -> (Fixture, Arc<Control>, Registration) {
         control.clone(),
     );
     (fixture, control, registration)
+}
+
+#[tokio::test]
+async fn sandbox_node_runc_and_docker_default_release_without_resolver_binds() {
+    for node_runtime in [Some("runc"), None] {
+        let (fixture, _control, _registration) =
+            sandbox_fixture_with(None, node_runtime, Vec::new()).await;
+        assert!(fixture.engine().resolv_conf.as_ref().unwrap().is_file());
+        let result = fixture
+            .call(AllocationRequest::Start(options(&fixture, "resolver")))
+            .await;
+        assert_eq!(result.status, "running", "node={node_runtime:?}");
+        {
+            let state = fixture.daemon.state.lock().unwrap();
+            let body = &state
+                .calls
+                .iter()
+                .find(|(_, path, _)| path.starts_with("/containers/create?"))
+                .unwrap()
+                .2;
+            assert_eq!(body["HostConfig"]["Runtime"], "runc");
+            assert!(body["HostConfig"].get("Binds").is_none());
+            assert_eq!(body["HostConfig"]["Mounts"].as_array().unwrap().len(), 2);
+        }
+        let record = oracle(&fixture, "resolver")();
+        assert_eq!(record["gate"]["phase"], "released");
+        assert_eq!(release_bytes(&record)[0], b'1');
+        assert_eq!(fixture.create_count(), 1);
+        assert_eq!(
+            fixture
+                .call(AllocationRequest::Destroy("resolver".into()))
+                .await
+                .status,
+            "destroyed"
+        );
+        assert!(!directory(&record).exists());
+    }
+}
+
+#[tokio::test]
+async fn sandbox_explicit_operator_dns_preserves_resolver_and_refuses_before_create() {
+    for (class_runtime, node_runtime) in [(Some("runc"), None), (None, Some("runc"))] {
+        let (fixture, _control, _registration) =
+            sandbox_fixture_with(class_runtime, node_runtime, vec!["9.9.9.9".into()]).await;
+        assert_eq!(
+            std::fs::read_to_string(fixture.engine().resolv_conf.as_ref().unwrap()).unwrap(),
+            "nameserver 9.9.9.9\n"
+        );
+        let result = fixture
+            .call(AllocationRequest::Start(options(&fixture, "operator-dns")))
+            .await;
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.reason.as_deref(), Some("sandboxControlsUnsupported"));
+        assert_eq!(fixture.create_count(), 0);
+        let record = oracle(&fixture, "operator-dns")();
+        assert_eq!(record["create_dispatched"], false);
+        assert_eq!(record["gate"]["phase"], "waiting");
+        assert_eq!(release_bytes(&record)[0], b'0');
+        assert_eq!(
+            fixture
+                .call(AllocationRequest::Destroy("operator-dns".into()))
+                .await
+                .status,
+            "destroyed"
+        );
+        assert!(!directory(&record).exists());
+    }
 }
 
 fn options(fixture: &Fixture, id: &str) -> AllocationOptions {
@@ -111,6 +192,8 @@ async fn receive(
 #[tokio::test]
 async fn sandbox_journalled_prepare_create_start_release_and_cleanup() {
     let (mut fixture, control, _registration) = sandbox_fixture().await;
+    assert_eq!(fixture.cell.spec.runtime.as_deref(), Some("runc"));
+    assert!(fixture.engine().resolv_conf.as_ref().unwrap().is_file());
     let snapshot = oracle(&fixture, "complete");
     let source = std::fs::read(&control.source).unwrap();
     fixture.daemon.state.lock().unwrap().sandbox_create_check = Some(Arc::new(move |body| {
@@ -145,6 +228,8 @@ async fn sandbox_journalled_prepare_create_start_release_and_cleanup() {
         assert_eq!(body["Entrypoint"][6], "server");
         assert_eq!(body["Healthcheck"]["Test"], json!(["NONE"]));
         assert_eq!(body["HostConfig"]["Init"], false);
+        assert_eq!(body["HostConfig"]["Runtime"], "runc");
+        assert!(body["HostConfig"].get("Binds").is_none());
     }));
     let snapshot = oracle(&fixture, "complete");
     fixture.daemon.state.lock().unwrap().sandbox_start_check = Some(Arc::new(move || {
