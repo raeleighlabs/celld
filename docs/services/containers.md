@@ -111,6 +111,25 @@ Container WebSocket upgrades preserve native socket ownership and negotiated
 subprotocols when forwarded through an object and Worker. They do not use a
 JavaScript relay. A connection does not survive container removal or hand-off.
 
+The duplex candidate adds synchronous `openDuplexAllocation(id, port)`. It
+requires the current actor's branded container receiver and confirmed running
+allocation, and returns `{version:1, authority:"celld-duplex:1", capability,
+expiresInMs:10000}`. The private HTTP listener accepts an HTTP/1.1
+`CONNECT celld-duplex:1` with `Authorization: Bearer <capability>`. The target is
+authority-form with no path, query or body. A 200 response switches to raw
+bidirectional bytes, suitable for HTTP/2 prior knowledge and gRPC. The public
+listener does not expose this transport. Treat the capability as a secret.
+
+Authority binds the allocation ID, native container, activation and exact port.
+It expires in ten seconds, is consumed once even on failed connect, and never
+accepts a caller-selected address. A live native socket lease spans routing,
+connect, upgrade and copying. Activation retirement, destroy intent, unknown
+allocation state, observed exit and node drain revoke it. Both TCP half-close
+directions are preserved with bounded buffering and independent backpressure.
+There are at most 256 pending capabilities and 256 pending/live transports per
+host service instance. Minting a capability alone does not pin an activation.
+This feature is not part of a published fork release.
+
 ### Cooperative hand-off
 
 Native allocations protect the existing owner record before dispatch. Release

@@ -1083,6 +1083,88 @@ impl Journal {
 }
 
 impl ContainerEngine {
+    /// Binds a private one-use tunnel to the event's exact live allocation and port.
+    pub fn allocation_duplex_target(
+        &self,
+        scope: &str,
+        epoch: Option<u64>,
+        id: &str,
+        port: u16,
+    ) -> anyhow::Result<super::AllocationDuplexTarget> {
+        valid_id(id)?;
+        anyhow::ensure!(port != 0, "duplex port is zero");
+        let cells = self.cells.lock().unwrap();
+        let cell = cells
+            .get(scope)
+            .ok_or_else(|| anyhow!("allocation detached"))?;
+        self.authorise_allocation_epoch(cell, epoch)?;
+        let state = cell.state.lock().unwrap();
+        let record = self
+            .allocations
+            .get(scope, id)?
+            .ok_or_else(|| anyhow!("allocation id is unknown"))?;
+        anyhow::ensure!(
+            record.create_confirmed
+                && !record.destroy_requested
+                && record.status == "running"
+                && record.container_id.is_some()
+                && record.container_id == state.allocation_container
+                && state.running,
+            "duplex allocation is not the selected running allocation"
+        );
+        Ok(super::AllocationDuplexTarget {
+            scope: scope.to_string(),
+            revoked: state.duplex_revocation.child_token(),
+            id: id.to_string(),
+            container: record
+                .container_id
+                .context("allocation container missing")?,
+            epoch: state.activation_epoch,
+            serial: state.activation_serial,
+            run: state.run,
+            port,
+        })
+    }
+
+    /// Rechecks sealed allocation authority without inspecting arbitrary Docker targets.
+    pub fn allocation_duplex_address(
+        &self,
+        target: &super::AllocationDuplexTarget,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        let cells = self.cells.lock().unwrap();
+        let cell = cells
+            .get(&target.scope)
+            .ok_or_else(|| anyhow!("allocation detached"))?;
+        self.authorise_allocation_epoch(cell, Some(target.epoch))?;
+        let state = cell.state.lock().unwrap();
+        let record = self
+            .allocations
+            .get(&target.scope, &target.id)?
+            .ok_or_else(|| anyhow!("allocation id is unknown"))?;
+        anyhow::ensure!(
+            !target.revoked.is_cancelled()
+                && state.activation_serial == target.serial
+                && state.run == target.run
+                && state.running
+                && record.create_confirmed
+                && !record.destroy_requested
+                && record.status == "running"
+                && record.container_id.as_deref() == Some(target.container.as_str())
+                && state.allocation_container == record.container_id,
+            "duplex allocation authority changed"
+        );
+        match &state.address {
+            Address::Ip(ip) => Ok(std::net::SocketAddr::new(ip.parse()?, target.port)),
+            Address::Published(ports) => {
+                let port = ports
+                    .get(&target.port)
+                    .context("duplex port not published")?;
+                Ok(std::net::SocketAddr::from(([127, 0, 0, 1], *port)))
+            }
+            Address::None => Err(anyhow!("duplex allocation has no address")),
+        }
+    }
+
     pub(crate) fn native_journal_identity(&self) -> anyhow::Result<String> {
         self.allocations.identity()
     }
@@ -1355,7 +1437,16 @@ impl ContainerEngine {
                     fresh
                 }
                 AllocationRequest::Destroy(id) => {
-                    self.allocations.reserve(&cell, None, id, &policy)?
+                    let fresh = self.allocations.reserve(&cell, None, id, &policy)?;
+                    let record = self.allocations.get(&cell.scope, id)?;
+                    let mut state = cell.state.lock().unwrap();
+                    if record.is_some_and(|record| {
+                        record.container_id.is_some()
+                            && record.container_id == state.allocation_container
+                    }) {
+                        state.revoke_duplex();
+                    }
+                    fresh
                 }
                 AllocationRequest::Inspect(id) => {
                     valid_id(id)?;
@@ -1628,6 +1719,7 @@ impl ContainerEngine {
         if let Some(cell) = self.cell(&record.scope) {
             let mut state = cell.state.lock().unwrap();
             state.running = false;
+            state.revoke_duplex();
             state.address = Address::None;
         }
         record.status = "unknown".to_string();
@@ -1800,6 +1892,7 @@ impl ContainerEngine {
         } else {
             let mut state = cell.state.lock().unwrap();
             state.running = false;
+            state.revoke_duplex();
             state.address = Address::None;
         }
         Ok(record.view(Some(observation)))
@@ -1823,6 +1916,7 @@ impl ContainerEngine {
         {
             let mut state = cell.state.lock().unwrap();
             state.running = false;
+            state.revoke_duplex();
             state.address = Address::None;
             if let Some(cancel) = state.allocation_sweeper.take() {
                 cancel.cancel();

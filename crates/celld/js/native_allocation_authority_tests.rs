@@ -70,6 +70,10 @@ fn native_allocation_v8_authority_brands_events_and_bounds_raw_arguments() {
         "__container_destroy_allocation",
         op_container_destroy_allocation
     );
+    install!(
+        "__container_open_duplex_allocation",
+        op_container_open_duplex_allocation
+    );
     macro_rules! evaluate {
         ($source:expr) => {{
             let source = v8::String::new(scope, $source).unwrap();
@@ -106,9 +110,14 @@ fn native_allocation_v8_authority_brands_events_and_bounds_raw_arguments() {
         throws(() => __container_start_allocation(tokenA, "{{}}"), "invalid allocation options");
         throws(() => __container_inspect_allocation(tokenA, "x".repeat(65)), "exceeds limit");
         throws(() => __container_destroy_allocation(tokenA, "x".repeat(65)), "exceeds limit");
+        throws(() => __container_open_duplex_allocation(other, "a", 8080), "receiver or activation");
+        throws(() => __container_open_duplex_allocation(tokenA, "x".repeat(65), 8080), "exceeds limit");
+        for (const port of [0, -1, 65536, 1.5, NaN, Infinity, "8080", null])
+          throws(() => __container_open_duplex_allocation(tokenA, "a", port), "integer");
         {}
         const owner = new Container(actor);
         const forged = {{ _scope: actor }};
+        throws(() => Container.prototype.openDuplexAllocation.call(forged, "a", 8080), "receiver");
         const errors = [];
         Container.prototype.inspectAllocation.call(forged, "a").catch(error => errors.push(String(error)));
         Container.prototype.destroyAllocation.call(forged, "a").catch(error => errors.push(String(error)));
@@ -171,6 +180,7 @@ fn native_allocation_v8_authority_brands_events_and_bounds_raw_arguments() {
         throws(() => __container_inspect_allocation(tokenA, "a"), "receiver or activation");
         throws(() => __container_destroy_allocation(tokenA, "a"), "receiver or activation");
         throws(() => __container_start_allocation(tokenA, "{}"), "receiver or activation");
+        throws(() => __container_open_duplex_allocation(tokenA, "a", 8080), "receiver or activation");
         throws(() => __storage_queue_put(tokenA, "foreign", 1), "receiver or activation");
     "#
     );

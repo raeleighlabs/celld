@@ -221,6 +221,25 @@ struct CellState {
     legacy_start: Option<LegacyStart>,
     inactivity_epoch: u64,
     allocation_sweeper: Option<tokio_util::sync::CancellationToken>,
+    duplex_revocation: tokio_util::sync::CancellationToken,
+}
+
+impl CellState {
+    fn revoke_duplex(&mut self) {
+        self.duplex_revocation.cancel();
+        self.duplex_revocation = tokio_util::sync::CancellationToken::new();
+    }
+}
+
+pub struct AllocationDuplexTarget {
+    pub scope: String,
+    pub revoked: tokio_util::sync::CancellationToken,
+    id: String,
+    container: String,
+    epoch: u64,
+    serial: u64,
+    run: u64,
+    port: u16,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -284,6 +303,7 @@ impl CellContainer {
     /// report the new container dead on arrival.
     pub fn begin_run(&self) -> u64 {
         let mut state = self.state.lock().unwrap();
+        state.revoke_duplex();
         state.run += 1;
         state.running = true;
         state.address = Address::None;
@@ -336,6 +356,7 @@ impl PendingContainerActivation {
         let activation = self.activation.clone();
         let _cells = self.engine.cells.lock().unwrap();
         let mut state = activation.cell.state.lock().unwrap();
+        state.revoke_duplex();
         // startup runs no container handler. authority transfers only with the runtime handle.
         state.activation_epoch = activation.epoch;
         state.activation_serial = activation.serial;
@@ -1081,6 +1102,7 @@ impl ContainerEngine {
                     }),
             });
             state.activation_pending = true;
+            state.revoke_duplex();
             (cell.clone(), inserted, serial)
         };
         let activation = ContainerActivation {
@@ -1271,6 +1293,7 @@ impl ContainerEngine {
             let mut state = cell.state.lock().unwrap();
             if state.run == run {
                 state.running = false;
+                state.revoke_duplex();
                 state.address = Address::None;
                 cell.exit
                     .send_replace(Some((run, Err(format!("{error:#}")))));
@@ -1515,6 +1538,7 @@ impl ContainerEngine {
             let mut state = cell_.state.lock().unwrap();
             if state.run == run {
                 state.running = false;
+                state.revoke_duplex();
                 state.address = Address::None;
             }
             drop(state);
@@ -1958,6 +1982,7 @@ impl ContainerEngine {
         // capturing an idle ticket alone does not retire a still-running actor.
         if retiring || mode == Release::Destroy {
             state.allocation_admitted = false;
+            state.revoke_duplex();
         }
         if mode == Release::Destroy {
             state.inactivity_epoch = state.inactivity_epoch.wrapping_add(1);
@@ -2035,6 +2060,7 @@ impl ContainerEngine {
                 legacy_start_pending: false,
             });
             state.allocation_admitted = false;
+            state.revoke_duplex();
         }
         self.prepare_startup_release(scope, epoch)
     }
@@ -2074,6 +2100,7 @@ impl ContainerEngine {
             }
         }
         state.allocation_admitted = false;
+        state.revoke_duplex();
         let activation = ContainerActivation {
             cell: cell.clone(),
             epoch: state.activation_epoch,
@@ -2299,6 +2326,7 @@ impl ContainerEngine {
                 "stale legacy release"
             );
             state.allocation_admitted = false;
+            state.revoke_duplex();
             self.allocations.request_legacy_cleanup(
                 &cell.scope,
                 allocation::LegacyCleanup {
