@@ -337,6 +337,229 @@ struct Fixture {
     _specs_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
+#[tokio::test]
+async fn duplex_capability_binds_exact_attempt_port_epoch_and_is_single_use() {
+    let fixture = Fixture::new().await;
+    let engine = fixture.engine();
+    let scope = &fixture.cell.scope;
+    let epoch = Some(fixture.activation().epoch);
+    assert!(engine
+        .allocation_duplex_target(scope, epoch, "duplex", 8080)
+        .is_err());
+    let view = fixture
+        .call(AllocationRequest::Start(fixture.options("duplex", false)))
+        .await;
+    assert_eq!(view.status, "running");
+    assert!(engine
+        .allocation_duplex_target(scope, epoch, "other", 8080)
+        .is_err());
+    assert!(engine
+        .allocation_duplex_target(scope, None, "duplex", 8080)
+        .is_err());
+    assert!(engine
+        .allocation_duplex_target(scope, epoch, "duplex", 0)
+        .is_err());
+    let target = engine
+        .allocation_duplex_target(scope, epoch, "duplex", 8080)
+        .unwrap();
+    let expected = if cfg!(target_os = "linux") {
+        "172.30.0.2:8080"
+    } else {
+        "127.0.0.1:32123"
+    };
+    assert_eq!(
+        engine
+            .allocation_duplex_address(&target)
+            .unwrap()
+            .to_string(),
+        expected
+    );
+    let service = crate::native_duplex::DuplexService::default();
+    let token = service
+        .mint(target, crate::native_ws::NativeOwner::default())
+        .unwrap();
+    let consumed = service.take(&token).unwrap();
+    assert!(service.take(&token).is_err());
+    assert!(service.take(&"0".repeat(64)).is_err());
+    assert!(service.take("not-a-token").is_err());
+    let before = fixture.daemon.state.lock().unwrap().calls.len();
+    engine.allocation_duplex_address(&consumed.target).unwrap();
+    assert_eq!(fixture.daemon.state.lock().unwrap().calls.len(), before);
+}
+
+#[tokio::test]
+async fn duplex_destroy_reservation_revokes_before_daemon_delete_settles() {
+    let fixture = Fixture::new().await;
+    fixture
+        .call(AllocationRequest::Start(fixture.options("duplex", false)))
+        .await;
+    let engine = fixture.engine();
+    let epoch = Some(fixture.activation().epoch);
+    let target = engine
+        .allocation_duplex_target(&fixture.cell.scope, epoch, "duplex", 8080)
+        .unwrap();
+    let revoked = target.revoked.clone();
+    let service = crate::native_duplex::DuplexService::default();
+    let token = service
+        .mint(target, crate::native_ws::NativeOwner::default())
+        .unwrap();
+    let gate = Gate::new();
+    fixture.daemon.state.lock().unwrap().delete_gate = Some(gate.clone());
+    let result = engine
+        .allocation_request_from_event(
+            fixture.cell.clone(),
+            AllocationRequest::Destroy("duplex".to_string()),
+            epoch,
+        )
+        .unwrap();
+    assert!(revoked.is_cancelled());
+    assert!(service.take(&token).is_err());
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    gate.open();
+    assert_eq!(result.await.unwrap().unwrap().status, "destroyed");
+}
+
+#[tokio::test]
+async fn duplex_destroy_replays_and_unknown_ids_preserve_successor_tunnel() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let fixture = Fixture::new().await;
+    fixture
+        .call(AllocationRequest::Start(fixture.options("a", false)))
+        .await;
+    fixture
+        .call(AllocationRequest::Destroy("a".to_string()))
+        .await;
+    fixture
+        .call(AllocationRequest::Start(fixture.options("b", true)))
+        .await;
+    let target = fixture
+        .engine()
+        .allocation_duplex_target(
+            &fixture.cell.scope,
+            Some(fixture.activation().epoch),
+            "b",
+            8080,
+        )
+        .unwrap();
+    let allocation_revoked = target.revoked.clone();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let (mut caller, client) = tokio::io::duplex(32);
+    let (upstream, mut workload) = tokio::io::duplex(32);
+    let copying = tokio::spawn(crate::native_duplex::pump(
+        client,
+        upstream,
+        stop.clone(),
+        allocation_revoked.clone(),
+    ));
+    for id in ["a", "unknown"] {
+        assert_eq!(
+            fixture
+                .call(AllocationRequest::Destroy(id.to_string()))
+                .await
+                .status,
+            "destroyed"
+        );
+        assert!(!allocation_revoked.is_cancelled(), "destroy {id} revoked b");
+        fixture.engine().allocation_duplex_address(&target).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            caller.write_all(b"b").await.unwrap();
+            let mut received = [0; 1];
+            workload.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"b");
+        })
+        .await
+        .unwrap();
+    }
+    stop.cancel();
+    assert!(copying.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn duplex_activation_replacement_retires_consumed_and_unconsumed_authority() {
+    let fixture = Fixture::new().await;
+    fixture
+        .call(AllocationRequest::Start(fixture.options("duplex", false)))
+        .await;
+    let engine = fixture.engine();
+    let epoch = Some(fixture.activation().epoch);
+    let target = engine
+        .allocation_duplex_target(&fixture.cell.scope, epoch, "duplex", 8080)
+        .unwrap();
+    let service = crate::native_duplex::DuplexService::default();
+    let activations = crate::native_ws::ActivationUpgrades::default();
+    activations.replace(&fixture.cell.scope, true);
+    let owner = activations.owner(&fixture.cell.scope);
+    let token = service.mint(target, owner.generation()).unwrap();
+    activations.replace(&fixture.cell.scope, true);
+    assert!(service.take(&token).is_err());
+    let target = engine
+        .allocation_duplex_target(&fixture.cell.scope, epoch, "duplex", 8080)
+        .unwrap();
+    let ticket = engine
+        .prepare_runtime_release(&fixture.activation(), Release::Keep)
+        .unwrap();
+    assert!(target.revoked.is_cancelled());
+    assert!(engine.allocation_duplex_address(&target).is_err());
+    engine.release(ticket).await.unwrap();
+}
+
+#[tokio::test]
+async fn duplex_service_bounds_metadata_and_transports_and_refuses_expired_authority() {
+    let fixture = Fixture::new().await;
+    fixture
+        .call(AllocationRequest::Start(fixture.options("duplex", false)))
+        .await;
+    let engine = fixture.engine();
+    let target = || {
+        engine
+            .allocation_duplex_target(
+                &fixture.cell.scope,
+                Some(fixture.activation().epoch),
+                "duplex",
+                8080,
+            )
+            .unwrap()
+    };
+    let service = crate::native_duplex::DuplexService::default();
+    let mut permits = Vec::new();
+    let mut tokens = Vec::new();
+    for _ in 0..256 {
+        permits.push(service.admit().unwrap());
+        tokens.push(
+            service
+                .mint(target(), crate::native_ws::NativeOwner::default())
+                .unwrap(),
+        );
+    }
+    assert!(service.admit().is_err());
+    assert!(service
+        .mint(target(), crate::native_ws::NativeOwner::default())
+        .is_err());
+    assert!(matches!(
+        service.take_admitted(&tokens[0]),
+        Err(crate::native_duplex::DuplexAdmissionError::Capacity)
+    ));
+    permits.pop();
+    assert!(service.admit().is_ok());
+    assert!(matches!(
+        service.take_admitted(&tokens[0]),
+        Err(crate::native_duplex::DuplexAdmissionError::InvalidCapability)
+    ));
+    service.take(&tokens[1]).unwrap();
+    let token = service
+        .mint(target(), crate::native_ws::NativeOwner::default())
+        .unwrap();
+    crate::asyncrt::sleep(crate::native_duplex::CONNECT_DEADLINE).await;
+    assert!(service.take(&token).is_err());
+    assert!(service
+        .mint(target(), crate::native_ws::NativeOwner::default())
+        .is_ok());
+}
+
 impl Fixture {
     async fn new() -> Self {
         static SPECS_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

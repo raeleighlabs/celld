@@ -33,6 +33,7 @@ pub struct HostServices {
     node_load: OnceLock<Arc<LiveLoad>>,
     wake_entry: crate::js::WakeEntryService,
     websockets: crate::js::WebSocketService,
+    duplex: crate::native_duplex::DuplexService,
     http_streams: Arc<crate::js::HttpStreamService>,
     metrics: MetricsBackend,
     #[cfg(all(test, celld_internal_tests))]
@@ -40,12 +41,17 @@ pub struct HostServices {
 }
 
 impl HostServices {
+    pub fn duplex(&self) -> &crate::native_duplex::DuplexService {
+        &self.duplex
+    }
+
     pub(crate) fn production() -> Self {
         Self {
             domain: OnceLock::new(),
             node_load: OnceLock::new(),
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
+            duplex: crate::native_duplex::DuplexService::default(),
             http_streams: Arc::new(crate::js::HttpStreamService::default()),
             metrics: MetricsBackend::Production(Mutex::new(ProcessLoadSampler::default())),
             #[cfg(all(test, celld_internal_tests))]
@@ -60,6 +66,7 @@ impl HostServices {
             node_load: OnceLock::new(),
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
+            duplex: crate::native_duplex::DuplexService::default(),
             http_streams: Arc::new(crate::js::HttpStreamService::default()),
             metrics: MetricsBackend::Scripted(Mutex::new(HostMetricsSample::default())),
             #[cfg(all(test, celld_internal_tests))]

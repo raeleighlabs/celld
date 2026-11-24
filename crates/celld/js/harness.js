@@ -2557,6 +2557,13 @@ class Container {
     if (typeof id !== "string") throw new TypeError("allocation id must be a string");
     return JSON.parse(await __container_destroy_allocation(brand.token, id));
   }
+  openDuplexAllocation(id, port) {
+    const brand = __allocationReceiver(this);
+    if (typeof id !== "string") throw new TypeError("allocation id must be a string");
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+      throw new RangeError("duplex port must be an integer from 1 to 65535");
+    return JSON.parse(__container_open_duplex_allocation(brand.token, id, port));
+  }
   async monitor() {
     if (!this.running)
       throw new Error("monitor() cannot be called on a container that is not running.");

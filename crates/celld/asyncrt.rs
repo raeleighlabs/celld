@@ -168,6 +168,16 @@ pub struct TaskHandle<T> {
 impl<T> Unpin for TaskHandle<T> {}
 
 impl<T> TaskHandle<T> {
+    /// Requests cancellation without treating it as proof the task has stopped.
+    pub fn abort(&self) {
+        self.inner.abort();
+    }
+
+    /// Reports whether the executor has completed or dropped this task.
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+
     /// Detach the task from its join handle.
     pub fn detach(self) {}
 }

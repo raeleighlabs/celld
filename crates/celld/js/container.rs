@@ -386,6 +386,60 @@ pub(super) fn op_container_destroy_allocation(
     allocation_op(scope, args, rv, "destroy");
 }
 
+pub(super) fn op_container_open_duplex_allocation(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let result = (|| {
+        let identity = allocation_authority(scope, args.get(0))?;
+        let id = bounded_string(scope, args.get(1), 64)?;
+        if !args.get(2).is_number() {
+            return Err("duplex port must be an integer from 1 to 65535".to_string());
+        }
+        let port = args
+            .get(2)
+            .number_value(scope)
+            .filter(|port| {
+                port.is_finite() && port.fract() == 0.0 && *port >= 1.0 && *port <= 65535.0
+            })
+            .ok_or_else(|| "duplex port must be an integer from 1 to 65535".to_string())?;
+        let engine = container::engine_if_ready()
+            .ok_or_else(|| "allocation engine is not attached".to_string())?;
+        let target = engine
+            .allocation_duplex_target(
+                &identity,
+                storage::activation_epoch(&identity),
+                &id,
+                port as u16,
+            )
+            .map_err(|error| format!("{error:#}"))?;
+        let (_, _, generation) = allocation_event(scope)?;
+        let runtime = actor_runtime_state(scope);
+        let table = runtime.native_activations.owner(&identity);
+        if table.generation().key() != generation {
+            return Err("duplex activation retired".to_string());
+        }
+        let token = asyncrt::services()
+            .duplex()
+            .mint(target, table.generation())
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<_, String>(
+            serde_json::json!({
+                "version": 1,
+                "authority": crate::native_duplex::AUTHORITY,
+                "capability": token,
+                "expiresInMs": crate::native_duplex::CONNECT_DEADLINE.as_millis(),
+            })
+            .to_string(),
+        )
+    })();
+    match result {
+        Ok(value) => rv.set(v8::String::new(scope, &value).unwrap().into()),
+        Err(error) => loader_throw(scope, &error),
+    }
+}
+
 pub(super) fn op_container_signal(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

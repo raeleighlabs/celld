@@ -2335,6 +2335,8 @@ pub(crate) async fn dispatch_forwarded_rpc(
     }
 }
 
+#[path = "main/native_duplex.rs"]
+mod native_duplex;
 #[path = "main/peer_tunnel.rs"]
 mod peer_tunnel;
 #[path = "main/websocket.rs"]
@@ -2886,7 +2888,11 @@ async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
     shutdown: mpsc::UnboundedSender<ShutdownMode>,
+    drain: watch::Receiver<bool>,
 ) -> Result<HttpReply, Infallible> {
+    if request.method() == hyper::Method::CONNECT {
+        return Ok(native_duplex::accept(request, app, drain).await);
+    }
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
     let do_scope = path.strip_prefix("/do/");
@@ -3282,14 +3288,18 @@ fn serve_http_connection(
         let served = tokio::spawn(async move {
             let connection_requests = ConnectionWorkerRequests::default();
             let service_requests = connection_requests.clone();
+            let service_drain = connection_drain.clone();
             let service = service_fn(move |request| {
                 let app = app.clone();
                 let shutdown = shutdown.clone();
                 let service_requests = service_requests.clone();
+                let service_drain = service_drain.clone();
                 async move {
                     match surface {
                         HttpSurface::Public => handle_public(request, app, service_requests).await,
-                        HttpSurface::Internal => handle_internal(request, app, shutdown).await,
+                        HttpSurface::Internal => {
+                            handle_internal(request, app, shutdown, service_drain).await
+                        }
                         HttpSurface::Recovery => {
                             let path = request.uri().path().to_string();
                             Ok(match path.as_str() {
